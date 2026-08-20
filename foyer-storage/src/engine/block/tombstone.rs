@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use bytes::{Buf, BufMut};
 use foyer_common::error::Result;
+use futures_util::{stream, StreamExt};
 use mea::mutex::Mutex;
 
 use crate::{
@@ -60,6 +61,8 @@ struct TombstoneLogInner {
 
 impl TombstoneLog {
     pub const SLOTS_PER_PAGE: usize = PAGE / Tombstone::serialized_len();
+    const RECOVER_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    const RECOVER_CONCURRENCY: usize = 8;
 
     /// Open the tombstone log with given a dedicated device.
     ///
@@ -72,25 +75,35 @@ impl TombstoneLog {
         let mut recovered = vec![];
 
         for partition in partitions.iter() {
-            for offset in (0..partition.size()).step_by(PAGE) {
-                tracing::trace!(offset, "[tombstone log]: recover at");
-                let buf = IoSliceMut::new(PAGE);
-                let (buffer, res) = io_engine.read(Box::new(buf), partition.as_ref(), offset as u64).await;
-                res?;
+            let size = partition.size();
+            let reads = (0..size).step_by(Self::RECOVER_CHUNK_SIZE).map(|offset| {
+                let len = Self::RECOVER_CHUNK_SIZE.min(size - offset);
+                let io_engine = io_engine.clone();
+                let partition = partition.clone();
+                async move {
+                    let buf = IoSliceMut::new(len);
+                    let (buf, res) = io_engine.read(Box::new(buf), partition.as_ref(), offset as u64).await;
+                    res.map(|()| buf)
+                }
+            });
+            let mut stream = stream::iter(reads).buffered(Self::RECOVER_CONCURRENCY);
+            while let Some(res) = stream.next().await {
+                let buffer = res?;
+                for page in buffer.chunks_exact(PAGE) {
+                    let mut seq = 0;
+                    let mut addr = 0;
 
-                let mut seq = 0;
-                let mut addr = 0;
-
-                for (slot, buf) in buffer.chunks_exact(Tombstone::serialized_len()).enumerate() {
-                    let tombstone = Tombstone::read(buf);
-                    if tombstone.sequence > seq {
-                        seq = tombstone.sequence;
-                        addr = slot * Tombstone::serialized_len();
+                    for (slot, buf) in page.chunks_exact(Tombstone::serialized_len()).enumerate() {
+                        let tombstone = Tombstone::read(buf);
+                        if tombstone.sequence > seq {
+                            seq = tombstone.sequence;
+                            addr = slot * Tombstone::serialized_len();
+                        }
+                        if tombstone.sequence == 0 {
+                            continue;
+                        }
+                        recovered.push((tombstone, addr));
                     }
-                    if tombstone.sequence == 0 {
-                        continue;
-                    }
-                    recovered.push((tombstone, addr));
                 }
             }
         }
@@ -313,6 +326,51 @@ mod tests {
             let (page, _) = log.slot_addr(inner.slot);
             assert_eq!(inner.buffer.page, page);
         }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_tombstone_log_multi_chunk_recovery() {
+        let dir = tempdir().unwrap();
+
+        let partition_size = 3 * TombstoneLog::RECOVER_CHUNK_SIZE;
+        let device = FsDeviceBuilder::new(dir.path())
+            .with_capacity(partition_size)
+            .build()
+            .unwrap();
+        let partition = device.create_partition(partition_size).unwrap();
+        let io_engine = PsyncIoEngineConfig::new()
+            .boxed()
+            .build(IoEngineBuildContext {
+                spawner: Spawner::current(),
+            })
+            .await
+            .unwrap();
+
+        let expected = (0..3usize)
+            .map(|i| Tombstone {
+                hash: 1000 + i as u64,
+                sequence: 1000 + i as u64,
+            })
+            .collect_vec();
+        for (i, tombstone) in expected.iter().enumerate() {
+            let mut buf = IoSliceMut::new(PAGE);
+            buf.as_mut().fill(0);
+            tombstone.write(&mut buf.as_mut()[..Tombstone::serialized_len()]);
+            let offset = (i * TombstoneLog::RECOVER_CHUNK_SIZE) as u64;
+            let (_, res) = io_engine.write(Box::new(buf), partition.as_ref(), offset).await;
+            res.unwrap();
+        }
+
+        let mut tombstones = vec![];
+        TombstoneLog::open(vec![partition.clone()], io_engine.clone(), &mut tombstones)
+            .await
+            .unwrap();
+
+        let mut got = tombstones.iter().map(|t| (t.hash, t.sequence)).collect_vec();
+        got.sort();
+        let mut want = expected.iter().map(|t| (t.hash, t.sequence)).collect_vec();
+        want.sort();
+        assert_eq!(got, want, "all tombstones across chunks must be recovered");
     }
 
     #[test]
