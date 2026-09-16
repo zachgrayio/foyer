@@ -33,14 +33,17 @@ pub use crate::{
     },
     memory::{
         Cache, CacheBuilder, CacheEntry, CacheProperties, EvictionConfig, FifoConfig, Filter, GetOrFetch, LfuConfig,
-        LruConfig, S3FifoConfig, Weighter,
+        LruConfig, MemoryEntrySnapshot, MemoryEvent, MemoryEventListener, MemoryRemovalReason, MemorySnapshotCursor,
+        MemorySnapshotPage, S3FifoConfig, Weighter,
     },
     storage::{
-        AdmitAll, Block, BlockEngineConfig, BlockStatistics, CombinedDeviceBuilder, Compression, Device, DeviceBuilder,
-        Engine, EngineBuildContext, EngineConfig, EstimatedSize, EvictionInfo, EvictionPicker, FifoPicker,
-        FileDeviceBuilder, FsDeviceBuilder, InvalidRatioPicker, IoEngine, IoEngineConfig, IoHandle, IopsCounter, Load,
-        NoopDeviceBuilder, NoopIoEngine, NoopIoEngineConfig, PartialDeviceBuilder, PsyncIoEngine, PsyncIoEngineConfig,
-        RawFile, RecoverMode, RejectAll, Statistics, StorageFilter, StorageFilterCondition, StorageFilterResult, Store,
+        AdmitAll, Block, BlockEngineConfig, BlockSnapshot, BlockState, BlockStatistics, CombinedDeviceBuilder,
+        Compression, Device, DeviceBuilder, DiskIndexCursor, DiskIndexEntry, DiskIndexPage, Engine, EngineBuildContext,
+        EngineConfig, EntryAddressSnapshot, EstimatedSize, EvictionInfo, EvictionPicker, FifoPicker, FileDeviceBuilder,
+        ForceReclaimError, FsDeviceBuilder, InspectedEntriesPage, InspectedEntry, InvalidRatioPicker, IoEngine,
+        IoEngineConfig, IoHandle, IopsCounter, Load, NoopIoEngine, NoopIoEngineConfig, PartialDeviceBuilder,
+        PsyncIoEngine, PsyncIoEngineConfig, RawFile, RecoverMode, RejectAll, Statistics, StorageEvent,
+        StorageEventListener, StorageFilter, StorageFilterCondition, StorageFilterResult, StorageRemovalReason, Store,
         StoreBuilder, Throttle,
     },
 };

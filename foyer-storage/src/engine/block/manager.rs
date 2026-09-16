@@ -14,10 +14,10 @@
 
 use std::{
     collections::{HashSet, VecDeque},
-    fmt::Debug,
+    fmt::{Debug, Display},
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock, RwLockWriteGuard,
     },
 };
@@ -41,6 +41,7 @@ use crate::{
         eviction::{EvictionInfo, EvictionPicker},
         reclaimer::ReclaimerTrait,
     },
+    engine::{StorageEvent, StorageEventObserver},
     io::{
         bytes::{IoB, IoBuf, IoBufMut},
         device::Partition,
@@ -50,6 +51,87 @@ use crate::{
 };
 
 pub type BlockId = u32;
+
+/// The current lifecycle state of a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockState {
+    /// The block has not been classified during recovery yet.
+    Initializing,
+    /// The block contains no entries and is available for writing.
+    Clean,
+    /// The block is currently receiving entries.
+    Writing,
+    /// The block contains entries and can be selected for reclamation.
+    Evictable,
+    /// The block is currently being reclaimed.
+    Reclaiming,
+}
+
+/// A validation failure while requesting explicit block reclamation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForceReclaimError {
+    /// The configured storage engine does not support block reclamation.
+    Unsupported,
+    /// The requested block identifier does not exist.
+    OutOfRange {
+        /// Requested block identifier.
+        block: BlockId,
+        /// Number of blocks in the engine.
+        blocks: usize,
+    },
+    /// The block has been reused since the caller's snapshot.
+    StaleGeneration {
+        /// Generation supplied by the caller.
+        expected: u64,
+        /// Current block generation.
+        actual: u64,
+    },
+    /// Only evictable blocks can be explicitly reclaimed.
+    NotEvictable {
+        /// Current lifecycle state of the block.
+        state: BlockState,
+    },
+}
+
+impl Display for ForceReclaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => write!(f, "block reclamation is not supported by this storage engine"),
+            Self::OutOfRange { block, blocks } => {
+                write!(f, "block {block} is out of range for an engine with {blocks} blocks")
+            }
+            Self::StaleGeneration { expected, actual } => {
+                write!(f, "block generation changed from {expected} to {actual}")
+            }
+            Self::NotEvictable { state } => write!(f, "block is {state:?}, not evictable"),
+        }
+    }
+}
+
+impl std::error::Error for ForceReclaimError {}
+
+/// A consistent, read-only snapshot of a block's physical state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSnapshot {
+    /// Block identifier within this engine.
+    pub id: BlockId,
+    /// Total block capacity in bytes.
+    pub size: usize,
+    /// Current lifecycle state.
+    pub state: BlockState,
+    /// Process-local allocation generation.
+    pub generation: u64,
+    /// Number of entries currently pointing into this block.
+    pub live_entries: usize,
+    /// Page-aligned bytes occupied by currently indexed entries.
+    pub live_bytes: usize,
+    /// Estimated bytes invalidated by replacement or deletion.
+    pub invalid_bytes: usize,
+    /// Number of accesses recorded for this block.
+    pub accesses: usize,
+    /// Whether the block is marked for eviction probation.
+    pub probation: bool,
+}
 
 /// Block statistics.
 #[derive(Debug, Default)]
@@ -157,12 +239,14 @@ struct State {
 #[derive(Debug)]
 struct Inner {
     blocks: Vec<Block>,
+    generations: Vec<AtomicU64>,
     state: RwLock<State>,
     reclaimer: Arc<dyn ReclaimerTrait>,
     reclaim_concurrency: usize,
     clean_block_threshold: usize,
     metrics: Arc<Metrics>,
     spawner: Spawner,
+    observer: StorageEventObserver,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +255,20 @@ pub struct BlockManager {
 }
 
 impl BlockManager {
+    fn block_state(state: &State, id: BlockId) -> BlockState {
+        if state.clean_blocks.contains(&id) {
+            BlockState::Clean
+        } else if state.writing_blocks.contains(&id) {
+            BlockState::Writing
+        } else if state.evictable_blocks.contains(&id) {
+            BlockState::Evictable
+        } else if state.reclaiming_blocks.contains(&id) {
+            BlockState::Reclaiming
+        } else {
+            BlockState::Initializing
+        }
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub fn open(
         device: Arc<dyn Device>,
@@ -182,6 +280,7 @@ impl BlockManager {
         clean_block_threshold: usize,
         metrics: Arc<Metrics>,
         spawner: Spawner,
+        observer: StorageEventObserver,
     ) -> Result<Self> {
         let mut blocks = vec![];
 
@@ -220,6 +319,7 @@ impl BlockManager {
             reclaim_waiters: Vec::new(),
         };
         let inner = Inner {
+            generations: (0..blocks.len()).map(|_| AtomicU64::new(0)).collect(),
             blocks,
             state: RwLock::new(state),
             reclaimer,
@@ -227,6 +327,7 @@ impl BlockManager {
             clean_block_threshold,
             metrics,
             spawner,
+            observer,
         };
         let inner = Arc::new(inner);
         let this = Self { inner };
@@ -290,6 +391,82 @@ impl BlockManager {
         &self.inner.blocks[id as usize]
     }
 
+    /// Snapshot the lifecycle state and statistics for every block.
+    pub fn snapshots(&self) -> Vec<BlockSnapshot> {
+        let state = self.inner.state.read().unwrap();
+        self.inner
+            .blocks
+            .iter()
+            .map(|block| {
+                let id = block.id();
+                let state = Self::block_state(&state, id);
+                let statistics = block.statistics();
+                BlockSnapshot {
+                    id,
+                    size: block.size(),
+                    state,
+                    generation: self.inner.generations[id as usize].load(Ordering::Relaxed),
+                    live_entries: 0,
+                    live_bytes: 0,
+                    invalid_bytes: statistics.invalid.load(Ordering::Relaxed),
+                    accesses: statistics.access.load(Ordering::Relaxed),
+                    probation: statistics.probation.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
+    /// Reclaim an exact evictable block if its generation still matches the caller's snapshot.
+    pub fn force_reclaim(&self, id: BlockId, expected_generation: u64) -> std::result::Result<(), ForceReclaimError> {
+        let block = {
+            let mut state = self.inner.state.write().unwrap();
+            if id as usize >= self.inner.blocks.len() {
+                return Err(ForceReclaimError::OutOfRange {
+                    block: id,
+                    blocks: self.inner.blocks.len(),
+                });
+            }
+
+            let generation = self.inner.generations[id as usize].load(Ordering::Relaxed);
+            if generation != expected_generation {
+                return Err(ForceReclaimError::StaleGeneration {
+                    expected: expected_generation,
+                    actual: generation,
+                });
+            }
+            if !state.evictable_blocks.remove(&id) {
+                return Err(ForceReclaimError::NotEvictable {
+                    state: Self::block_state(&state, id),
+                });
+            }
+
+            self.inner.metrics.storage_block_engine_block_evictable.decrease(1);
+            let mut pickers = std::mem::take(&mut state.eviction_pickers);
+            for picker in pickers.iter_mut() {
+                picker.on_block_evict(
+                    EvictionInfo {
+                        blocks: &self.inner.blocks,
+                        evictable: &state.evictable_blocks,
+                        clean: state.clean_blocks.len(),
+                    },
+                    id,
+                );
+            }
+            std::mem::swap(&mut state.eviction_pickers, &mut pickers);
+            assert!(pickers.is_empty());
+
+            state.reclaiming_blocks.insert(id);
+            self.inner.metrics.storage_block_engine_block_reclaiming.increase(1);
+            ReclaimingBlock {
+                block_manager: self.clone(),
+                block: self.inner.blocks[id as usize].clone(),
+                reinsert: false,
+            }
+        };
+        self.start_reclaim(block);
+        Ok(())
+    }
+
     pub fn get_clean_block(&self) -> GetCleanBlockHandle {
         let this = self.clone();
         async move {
@@ -298,10 +475,20 @@ impl BlockManager {
                 let mut state = this.inner.state.write().unwrap();
                 if let Some(id) = state.clean_blocks.pop_front() {
                     let block = this.inner.blocks[id as usize].clone();
+                    let generation = this.inner.generations[id as usize].fetch_add(1, Ordering::Relaxed) + 1;
                     state.writing_blocks.insert(id);
                     this.inner.metrics.storage_block_engine_block_clean.decrease(1);
                     this.inner.metrics.storage_block_engine_block_writing.increase(1);
-                    this.reclaim_if_needed(&mut state);
+                    let reclaiming = this.reclaim_if_needed(&mut state);
+                    drop(state);
+                    this.inner.observer.emit(StorageEvent::BlockStateChanged {
+                        block: id,
+                        generation,
+                        state: BlockState::Writing,
+                    });
+                    if let Some(reclaiming) = reclaiming {
+                        this.start_reclaim(reclaiming);
+                    }
                     return block;
                 } else {
                     let (tx, rx) = oneshot::channel();
@@ -350,43 +537,85 @@ impl BlockManager {
             "[block manager]: Block state transfers from writing to evictable."
         );
 
-        self.reclaim_if_needed(&mut state);
+        let generation = self.inner.generations[block.id() as usize].load(Ordering::Relaxed);
+        let reclaiming = self.reclaim_if_needed(&mut state);
+        drop(state);
+        self.inner.observer.emit(StorageEvent::BlockStateChanged {
+            block: block.id(),
+            generation,
+            state: BlockState::Evictable,
+        });
+        if let Some(reclaiming) = reclaiming {
+            self.start_reclaim(reclaiming);
+        }
     }
 
     fn on_reclaim_finish(&self, block: Block) {
         let mut state = self.inner.state.write().unwrap();
+        let id = block.id();
         state.reclaiming_blocks.remove(&block.id());
         self.inner.metrics.storage_block_engine_block_reclaiming.decrease(1);
-        if let Some(waiter) = state.clean_block_waiters.pop() {
+        let waiter = state.clean_block_waiters.pop();
+        let (generation, block_state) = if waiter.is_some() {
+            let generation = self.inner.generations[id as usize].fetch_add(1, Ordering::Relaxed) + 1;
+            state.writing_blocks.insert(id);
             self.inner.metrics.storage_block_engine_block_writing.increase(1);
-            let _ = waiter.send(block);
+            (generation, BlockState::Writing)
         } else {
             self.inner.metrics.storage_block_engine_block_clean.increase(1);
-            state.clean_blocks.push_back(block.id());
-        }
-        self.reclaim_if_needed(&mut state);
+            state.clean_blocks.push_back(id);
+            (
+                self.inner.generations[id as usize].load(Ordering::Relaxed),
+                BlockState::Clean,
+            )
+        };
+        let reclaiming = self.reclaim_if_needed(&mut state);
         if state.reclaiming_blocks.is_empty() {
             for tx in std::mem::take(&mut state.reclaim_waiters) {
                 let _ = tx.send(());
             }
         }
+        drop(state);
+        self.inner.observer.emit(StorageEvent::BlockStateChanged {
+            block: id,
+            generation,
+            state: block_state,
+        });
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(block);
+        }
+        if let Some(reclaiming) = reclaiming {
+            self.start_reclaim(reclaiming);
+        }
     }
 
-    fn reclaim_if_needed<'a>(&self, state: &mut RwLockWriteGuard<'a, State>) {
+    fn reclaim_if_needed<'a>(&self, state: &mut RwLockWriteGuard<'a, State>) -> Option<ReclaimingBlock> {
         if state.clean_blocks.len() < self.inner.clean_block_threshold
             && state.reclaiming_blocks.len() < self.inner.reclaim_concurrency
         {
             if let Some(block) = self.evict(state) {
                 state.reclaiming_blocks.insert(block.id());
                 self.inner.metrics.storage_block_engine_block_reclaiming.increase(1);
-                let block = ReclaimingBlock {
+                return Some(ReclaimingBlock {
                     block_manager: self.clone(),
                     block,
-                };
-                let future = self.inner.reclaimer.reclaim(block);
-                self.inner.spawner.spawn(future);
+                    reinsert: true,
+                });
             }
         }
+        None
+    }
+
+    fn start_reclaim(&self, block: ReclaimingBlock) {
+        let id = block.id();
+        let generation = self.inner.generations[id as usize].load(Ordering::Relaxed);
+        self.inner.observer.emit(StorageEvent::BlockStateChanged {
+            block: id,
+            generation,
+            state: BlockState::Reclaiming,
+        });
+        let future = self.inner.reclaimer.reclaim(block);
+        self.inner.spawner.spawn(future);
     }
 
     fn evict<'a>(&self, state: &mut RwLockWriteGuard<'a, State>) -> Option<Block> {
@@ -458,6 +687,13 @@ impl BlockManager {
 pub struct ReclaimingBlock {
     block_manager: BlockManager,
     block: Block,
+    reinsert: bool,
+}
+
+impl ReclaimingBlock {
+    pub(crate) fn reinsert(&self) -> bool {
+        self.reinsert
+    }
 }
 
 impl Deref for ReclaimingBlock {

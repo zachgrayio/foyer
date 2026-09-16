@@ -20,7 +20,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "tracing")]
@@ -43,7 +43,7 @@ use mea::mpsc::UnboundedReceiver;
 
 use super::{
     flusher::{Flusher, InvalidStats, Submission},
-    indexer::Indexer,
+    indexer::{EntryAddress, Indexer},
     recover::RecoverRunner,
 };
 #[cfg(any(test, feature = "test_utils"))]
@@ -53,12 +53,14 @@ use crate::{
     engine::{
         block::{
             eviction::{EvictionPicker, FifoPicker, InvalidRatioPicker},
-            manager::{BlockId, BlockManager},
+            manager::{BlockId, BlockManager, BlockSnapshot, ForceReclaimError},
             reclaimer::{BlockCleaner, Reclaimer, ReclaimerTrait},
             serde::{AtomicSequence, EntryHeader},
             tombstone::{Tombstone, TombstoneLog},
         },
-        Engine, EngineBuildContext, EngineConfig, Populated,
+        DiskIndexCursor, DiskIndexPage, Engine, EngineBuildContext, EngineConfig, EntryAddressSnapshot,
+        InspectedEntriesPage, InspectedEntry, Populated, StorageEvent, StorageEventListener, StorageEventObserver,
+        StorageRemovalReason,
     },
     filter::conditions::IoThrottle,
     io::{bytes::IoSliceMut, PAGE},
@@ -96,6 +98,8 @@ where
     admission_filter: StorageFilter,
     reinsertion_filter: StorageFilter,
     enable_tombstone_log: bool,
+    event_listener: Option<Arc<dyn StorageEventListener>>,
+    access_event_interval: Duration,
     #[cfg(any(test, feature = "test_utils"))]
     flush_switch: Switch,
     #[cfg(any(test, feature = "test_utils"))]
@@ -154,6 +158,8 @@ where
             admission_filter: StorageFilter::new(),
             reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
             enable_tombstone_log: false,
+            event_listener: None,
+            access_event_interval: Duration::from_secs(1),
             #[cfg(any(test, feature = "test_utils"))]
             flush_switch: Switch::default(),
             #[cfg(any(test, feature = "test_utils"))]
@@ -306,6 +312,21 @@ where
         self
     }
 
+    /// Register a non-blocking listener for best-effort structural storage events.
+    ///
+    /// Implementations must not block. Consumers must use snapshots as the source of truth and resynchronize when
+    /// [`Engine::dropped_inspection_events`] increases.
+    pub fn with_event_listener(mut self, listener: Arc<dyn StorageEventListener>) -> Self {
+        self.event_listener = Some(listener);
+        self
+    }
+
+    /// Set the minimum interval between reported disk accesses for one live address.
+    pub fn with_access_event_interval(mut self, interval: Duration) -> Self {
+        self.access_event_interval = interval;
+        self
+    }
+
     /// Pass the flush holder for test.
     #[cfg(any(test, feature = "test_utils"))]
     pub fn with_flush_switch(mut self, flush_switch: Switch) -> Self {
@@ -357,6 +378,7 @@ where
 
         let indexer = Indexer::new(self.indexer_shards);
         let submit_queue_size = Arc::<AtomicUsize>::default();
+        let observer = StorageEventObserver::new(self.event_listener);
 
         #[expect(clippy::type_complexity)]
         let (flushers, rxs): (Vec<Flusher<K, V, P>>, Vec<UnboundedReceiver<Submission<K, V, P>>>) = (0..self.flushers)
@@ -370,6 +392,7 @@ where
             self.blob_index_size,
             device.statistics().clone(),
             runtime.clone(),
+            observer.clone(),
         );
         let reclaimer: Arc<dyn ReclaimerTrait> = Arc::new(reclaimer);
 
@@ -383,6 +406,7 @@ where
             self.clean_block_threshold,
             metrics.clone(),
             runtime.clone(),
+            observer.clone(),
         )?;
         let blocks = block_manager.blocks();
 
@@ -422,6 +446,7 @@ where
                 tombstone_log.clone(),
                 metrics.clone(),
                 &runtime,
+                observer.clone(),
                 #[cfg(any(test, feature = "test_utils"))]
                 self.flush_switch.clone(),
             )?;
@@ -440,6 +465,13 @@ where
             sequence,
             _spawner: runtime,
             active: AtomicBool::new(true),
+            observer,
+            access_event_interval_micros: self
+                .access_event_interval
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX)
+                .max(1),
             metrics,
             #[cfg(any(test, feature = "test_utils"))]
             flush_switch: self.flush_switch,
@@ -520,6 +552,9 @@ where
 
     active: AtomicBool,
 
+    observer: StorageEventObserver,
+    access_event_interval_micros: u64,
+
     metrics: Arc<Metrics>,
 
     #[cfg(any(test, feature = "test_utils"))]
@@ -548,6 +583,159 @@ where
     V: StorageValue,
     P: Properties,
 {
+    fn inspect_blocks(&self) -> Vec<BlockSnapshot> {
+        let mut snapshots = self.inner.block_manager.snapshots();
+        for entry in self.inner.indexer.snapshot_all() {
+            if let Some(snapshot) = snapshots.get_mut(entry.address.block as usize) {
+                snapshot.live_entries += 1;
+                snapshot.live_bytes += bits::align_up(PAGE, entry.address.len as usize);
+            }
+        }
+        snapshots
+    }
+
+    async fn inspect_address(&self, hash: u64, address: EntryAddress) -> Result<Option<InspectedEntry<K>>> {
+        if self.inner.indexer.locate(hash).as_ref() != Some(&address) {
+            return Ok(None);
+        }
+
+        let block = self.inner.block_manager.block(address.block);
+        let header_bytes = IoSliceMut::new(PAGE);
+        let (header_bytes, result) = block.read(Box::new(header_bytes), address.offset as u64).await;
+        result?;
+        let header = EntryHeader::read(&header_bytes[..EntryHeader::serialized_len()])?;
+
+        if header.hash != hash || header.sequence != address.sequence {
+            if self.inner.indexer.locate(hash).as_ref() != Some(&address) {
+                return Ok(None);
+            }
+            return Err(Error::new(
+                ErrorKind::ChecksumMismatch,
+                "indexed entry header does not match its address",
+            )
+            .with_context("hash", hash)
+            .with_context("block", address.block)
+            .with_context("offset", address.offset));
+        }
+
+        let key_start = EntryHeader::serialized_len()
+            .checked_add(header.value_len as usize)
+            .ok_or_else(|| Error::new(ErrorKind::OutOfRange, "entry key offset overflow"))?;
+        let key_end = key_start
+            .checked_add(header.key_len as usize)
+            .ok_or_else(|| Error::new(ErrorKind::OutOfRange, "entry key length overflow"))?;
+        if key_end != address.len as usize {
+            return Err(
+                Error::new(ErrorKind::OutOfRange, "indexed entry length does not match its header")
+                    .with_context("indexed", address.len)
+                    .with_context("header", key_end),
+            );
+        }
+
+        let read_start = key_start / PAGE * PAGE;
+        let read_end = bits::align_up(PAGE, key_end);
+        let read_offset = address.offset as usize + read_start;
+        if read_offset
+            .checked_add(read_end - read_start)
+            .is_none_or(|end| end > block.size())
+        {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "entry key extends past the end of its block",
+            ));
+        }
+
+        let key_bytes = IoSliceMut::new(read_end - read_start);
+        let (key_bytes, result) = block.read(Box::new(key_bytes), read_offset as u64).await;
+        result?;
+        let key_offset = key_start - read_start;
+        let key = K::decode(&mut &key_bytes[key_offset..key_offset + header.key_len as usize])?;
+
+        if self.inner.indexer.locate(hash).as_ref() != Some(&address) {
+            return Ok(None);
+        }
+
+        Ok(Some(InspectedEntry {
+            hash,
+            key,
+            address: EntryAddressSnapshot {
+                block: address.block,
+                offset: address.offset,
+                len: address.len,
+                sequence: address.sequence,
+                inserted_at_unix_micros: address.inserted_at_unix_micros,
+                last_accessed_at_unix_micros: address.last_accessed_at_unix_micros.load(Ordering::Relaxed),
+            },
+        }))
+    }
+
+    fn inspect_entry(&self, hash: u64) -> impl Future<Output = Result<Option<InspectedEntry<K>>>> + Send + 'static {
+        let this = self.clone();
+        async move {
+            let Some(address) = this.inner.indexer.locate(hash) else {
+                return Ok(None);
+            };
+            this.inspect_address(hash, address).await
+        }
+    }
+
+    fn inspect_entries_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> impl Future<Output = Result<InspectedEntriesPage<K>>> + Send + 'static {
+        let this = self.clone();
+        async move {
+            let (total, addresses) = this.inner.indexer.snapshot_page(offset, limit);
+            let next_offset = offset.saturating_add(addresses.len());
+            let mut entries = Vec::with_capacity(addresses.len());
+            for entry in addresses {
+                if let Some(entry) = this.inspect_address(entry.hash, entry.address).await? {
+                    entries.push(entry);
+                }
+            }
+            Ok(InspectedEntriesPage {
+                total,
+                next_offset,
+                entries,
+            })
+        }
+    }
+
+    fn inspect_block(
+        &self,
+        block: BlockId,
+    ) -> impl Future<Output = Result<Option<Vec<InspectedEntry<K>>>>> + Send + 'static {
+        let this = self.clone();
+        async move {
+            if block as usize >= this.inner.block_manager.blocks() {
+                return Ok(None);
+            }
+            let addresses = this.inner.indexer.snapshot_block(block);
+            let mut entries = Vec::with_capacity(addresses.len());
+            for entry in addresses {
+                if let Some(entry) = this.inspect_address(entry.hash, entry.address).await? {
+                    entries.push(entry);
+                }
+            }
+            entries.sort_unstable_by_key(|entry| (entry.address.offset, entry.hash));
+            Ok(Some(entries))
+        }
+    }
+
+    fn force_reclaim(
+        &self,
+        block: BlockId,
+        expected_generation: u64,
+    ) -> impl Future<Output = std::result::Result<(), ForceReclaimError>> + Send + 'static {
+        let block_manager = self.inner.block_manager.clone();
+        async move {
+            block_manager.force_reclaim(block, expected_generation)?;
+            block_manager.wait_reclaim().await;
+            Ok(())
+        }
+    }
+
     fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
         let flushers = self.inner.flushers.clone();
         let block_manager = self.inner.block_manager.clone();
@@ -611,6 +799,8 @@ where
         let indexer = self.inner.indexer.clone();
         let metrics = self.inner.metrics.clone();
         let block_manager = self.inner.block_manager.clone();
+        let observer = self.inner.observer.clone();
+        let access_event_interval_micros = self.inner.access_event_interval_micros;
 
         let load = async move {
             #[cfg(any(test, feature = "test_utils"))]
@@ -654,7 +844,13 @@ where
                                 ?e,
                                 "[block engine load]: deserialize read buffer raise error, remove this entry and skip"
                             );
-                            indexer.remove(hash);
+                            if let Some(address) = indexer.remove(hash) {
+                                observer.emit(StorageEvent::EntryRemoved {
+                                    hash,
+                                    address: EntryAddressSnapshot::from(address),
+                                    reason: StorageRemovalReason::Invalid,
+                                });
+                            }
                             Ok(Load::Miss)
                         }
                         _ => {
@@ -685,7 +881,13 @@ where
                                 ?e,
                                 "[block engine load]: deserialize read buffer raise error, remove this entry and skip"
                             );
-                                indexer.remove(hash);
+                                if let Some(address) = indexer.remove(hash) {
+                                    observer.emit(StorageEvent::EntryRemoved {
+                                        hash,
+                                        address: EntryAddressSnapshot::from(address),
+                                        reason: StorageRemovalReason::Invalid,
+                                    });
+                                }
                                 Ok(Load::Miss)
                             }
                             _ => {
@@ -705,6 +907,23 @@ where
                 true => Age::Old,
                 false => Age::Young,
             };
+
+            if observer.is_enabled() && indexer.locate(hash).as_ref() == Some(&addr) {
+                let accessed_at_unix_micros = addr.last_accessed_at_unix_micros.load(Ordering::Relaxed);
+                let bucket = accessed_at_unix_micros / access_event_interval_micros;
+                if addr
+                    .last_access_report_bucket
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        (bucket > current).then_some(bucket)
+                    })
+                    .is_ok()
+                {
+                    observer.emit(StorageEvent::EntryAccessed {
+                        hash,
+                        address: EntryAddressSnapshot::from(addr.clone()),
+                    });
+                }
+            }
 
             Ok(Load::Entry {
                 key,
@@ -726,14 +945,18 @@ where
         }
 
         let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed);
-        let stats = self
-            .inner
-            .indexer
-            .insert_tombstone(hash, sequence)
-            .map(|addr| InvalidStats {
-                block: addr.block,
-                size: bits::align_up(PAGE, addr.len as usize),
+        let removed = self.inner.indexer.insert_tombstone(hash, sequence);
+        if let Some(address) = removed.clone() {
+            self.inner.observer.emit(StorageEvent::EntryRemoved {
+                hash,
+                address: EntryAddressSnapshot::from(address),
+                reason: StorageRemovalReason::Deleted,
             });
+        }
+        let stats = removed.map(|addr| InvalidStats {
+            block: addr.block,
+            size: bits::align_up(PAGE, addr.len as usize),
+        });
 
         let this = self.clone();
 
@@ -744,7 +967,7 @@ where
     }
 
     fn may_contains(&self, hash: u64) -> bool {
-        self.inner.indexer.get(hash).is_some()
+        self.inner.indexer.locate(hash).is_some()
     }
 
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
@@ -829,6 +1052,69 @@ where
         self.may_contains(hash)
     }
 
+    fn inspect_blocks(&self) -> Option<Vec<BlockSnapshot>> {
+        Some(self.inspect_blocks())
+    }
+
+    fn inspect_entry(&self, hash: u64) -> BoxFuture<'static, Result<Option<InspectedEntry<K>>>> {
+        self.inspect_entry(hash).boxed()
+    }
+
+    fn inspect_entry_at(
+        &self,
+        hash: u64,
+        address: EntryAddressSnapshot,
+    ) -> BoxFuture<'static, Result<Option<InspectedEntry<K>>>> {
+        let this = self.clone();
+        async move {
+            let Some(current) = this.inner.indexer.locate(hash) else {
+                return Ok(None);
+            };
+            if current.block != address.block
+                || current.offset != address.offset
+                || current.len != address.len
+                || current.sequence != address.sequence
+            {
+                return Ok(None);
+            }
+            this.inspect_address(hash, current).await
+        }
+        .boxed()
+    }
+
+    fn inspect_address(&self, hash: u64) -> Option<EntryAddressSnapshot> {
+        self.inner.indexer.locate(hash).map(Into::into)
+    }
+
+    fn inspect_disk_index_page(&self, cursor: Option<DiskIndexCursor>, limit: usize) -> Option<DiskIndexPage> {
+        Some(self.inner.indexer.snapshot_cursor(cursor, limit))
+    }
+
+    fn inspect_entries_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> BoxFuture<'static, Result<Option<InspectedEntriesPage<K>>>> {
+        let this = self.clone();
+        async move { this.inspect_entries_page(offset, limit).await.map(Some) }.boxed()
+    }
+
+    fn inspect_block(&self, block: u32) -> BoxFuture<'static, Result<Option<Vec<InspectedEntry<K>>>>> {
+        self.inspect_block(block).boxed()
+    }
+
+    fn force_reclaim(
+        &self,
+        block: u32,
+        expected_generation: u64,
+    ) -> BoxFuture<'static, std::result::Result<(), ForceReclaimError>> {
+        self.force_reclaim(block, expected_generation).boxed()
+    }
+
+    fn dropped_inspection_events(&self) -> u64 {
+        self.inner.observer.dropped()
+    }
+
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
         self.destroy()
     }
@@ -846,7 +1132,12 @@ where
 #[cfg(test)]
 mod tests {
 
-    use std::{fs::File, path::Path};
+    use std::{
+        collections::HashSet,
+        fs::File,
+        path::Path,
+        sync::{atomic::AtomicBool as TestAtomicBool, Mutex},
+    };
 
     use bytesize::ByteSize;
     use foyer_common::hasher::ModHasher;
@@ -893,6 +1184,14 @@ mod tests {
         dir: impl AsRef<Path>,
         reinsertion_filter: StorageFilter,
     ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        store_for_test_with_options(dir, reinsertion_filter, None).await
+    }
+
+    async fn store_for_test_with_options(
+        dir: impl AsRef<Path>,
+        reinsertion_filter: StorageFilter,
+        event_listener: Option<Arc<dyn StorageEventListener>>,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
         let device = FsDeviceBuilder::new(dir)
             .with_capacity(ByteSize::kib(64).as_u64() as _)
             .build()
@@ -913,6 +1212,8 @@ mod tests {
             eviction_pickers: vec![Box::<FifoPicker>::default()],
             reinsertion_filter,
             enable_tombstone_log: false,
+            event_listener,
+            access_event_interval: Duration::from_secs(1),
             buffer_pool_size: 16 * 1024 * 1024,
             blob_index_size: 4 * 1024,
             submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
@@ -956,6 +1257,8 @@ mod tests {
             admission_filter: StorageFilter::new(),
             reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
             enable_tombstone_log: true,
+            event_listener: None,
+            access_event_interval: Duration::from_secs(1),
             buffer_pool_size: 16 * 1024 * 1024,
             blob_index_size: 4 * 1024,
             submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
@@ -981,6 +1284,214 @@ mod tests {
     ) {
         let estimated_size = EntrySerializer::estimated_size(entry.key(), entry.value());
         store.enqueue(entry.piece().into(), estimated_size);
+    }
+
+    #[derive(Debug)]
+    struct RecordingEventListener {
+        accept: TestAtomicBool,
+        events: Mutex<Vec<StorageEvent>>,
+    }
+
+    impl StorageEventListener for RecordingEventListener {
+        fn try_on_event(&self, event: StorageEvent) -> bool {
+            if !self.accept.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.events.lock().unwrap().push(event);
+            true
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_storage_event_order_and_drop_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = Arc::new(RecordingEventListener {
+            accept: TestAtomicBool::new(true),
+            events: Mutex::new(vec![]),
+        });
+        let memory = cache_for_test();
+        let store = store_for_test_with_options(
+            dir.path(),
+            StorageFilter::new().with_condition(RejectAll),
+            Some(listener.clone()),
+        )
+        .await;
+
+        let entry = memory.insert(42, vec![7; 7 * KB]);
+        let hash = entry.hash();
+        enqueue(&store, entry);
+        store.wait().await;
+        assert!(matches!(store.load(hash).await.unwrap(), Load::Entry { .. }));
+        assert!(matches!(store.load(hash).await.unwrap(), Load::Entry { .. }));
+        store.delete(hash);
+
+        let events = listener.events.lock().unwrap();
+        let writing = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    StorageEvent::BlockStateChanged {
+                        state: crate::BlockState::Writing,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let committed = events
+            .iter()
+            .position(
+                |event| matches!(event, StorageEvent::EntryCommitted { hash: event_hash, .. } if *event_hash == hash),
+            )
+            .unwrap();
+        let deleted = events
+            .iter()
+            .position(|event| matches!(event, StorageEvent::EntryRemoved { hash: event_hash, reason: StorageRemovalReason::Deleted, .. } if *event_hash == hash))
+            .unwrap();
+        let accessed = events
+            .iter()
+            .filter(
+                |event| matches!(event, StorageEvent::EntryAccessed { hash: event_hash, .. } if *event_hash == hash),
+            )
+            .count();
+        assert!(writing < committed);
+        assert!(committed < deleted);
+        assert_eq!(accessed, 1);
+        drop(events);
+
+        listener.accept.store(false, Ordering::Relaxed);
+        let entry = memory.insert(43, vec![8; KB]);
+        enqueue(&store, entry);
+        store.wait().await;
+        assert!(store.dropped_inspection_events() > 0);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_inspect_live_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let store = engine_for_test(dir.path()).await;
+
+        let entry = memory.insert(42, vec![7; 7 * KB]);
+        let hash = entry.hash();
+        enqueue(&store, entry);
+        store.wait().await;
+
+        let accessed_before = store
+            .inner
+            .indexer
+            .locate(hash)
+            .unwrap()
+            .last_accessed_at_unix_micros
+            .load(Ordering::Relaxed);
+        let inspected = store.inspect_entry(hash).await.unwrap().unwrap();
+        assert_eq!(inspected.hash, hash);
+        assert_eq!(inspected.key, 42);
+        assert_eq!(
+            store.inspect_entry_at(hash, inspected.address.clone()).await.unwrap(),
+            Some(inspected.clone())
+        );
+        let mut stale_address = inspected.address.clone();
+        stale_address.sequence = stale_address.sequence.saturating_add(1);
+        assert!(store.inspect_entry_at(hash, stale_address).await.unwrap().is_none());
+        let page = store.inspect_entries_page(0, 1).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.next_offset, 1);
+        assert_eq!(page.entries, vec![inspected.clone()]);
+        assert_eq!(
+            store
+                .inner
+                .indexer
+                .locate(hash)
+                .unwrap()
+                .last_accessed_at_unix_micros
+                .load(Ordering::Relaxed),
+            accessed_before
+        );
+
+        let block = inspected.address.block;
+        let block_entries = store.inspect_block(block).await.unwrap().unwrap();
+        assert_eq!(block_entries, vec![inspected]);
+
+        let block_snapshot = store
+            .inspect_blocks()
+            .into_iter()
+            .find(|snapshot| snapshot.id == block)
+            .unwrap();
+        assert_eq!(block_snapshot.state, crate::BlockState::Writing);
+        assert_eq!(block_snapshot.generation, 1);
+        assert_eq!(block_snapshot.live_entries, 1);
+        assert_eq!(block_snapshot.live_bytes, 2 * PAGE);
+
+        store.delete(hash);
+        assert!(store.inspect_entry(hash).await.unwrap().is_none());
+        assert!(store.inspect_block(block).await.unwrap().unwrap().is_empty());
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_force_reclaim_validates_generation_and_removes_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = Arc::new(RecordingEventListener {
+            accept: TestAtomicBool::new(true),
+            events: Mutex::new(vec![]),
+        });
+        let memory = cache_for_test();
+        let store = store_for_test_with_options(dir.path(), StorageFilter::new(), Some(listener.clone())).await;
+
+        store.hold_flush();
+        let first = memory.insert(1, vec![1; 7 * KB]);
+        let first_hash = first.hash();
+        enqueue(&store, first);
+        let second = memory.insert(2, vec![2; 3 * KB]);
+        let second_hash = second.hash();
+        enqueue(&store, second);
+        let rollover = memory.insert(3, vec![3; 7 * KB]);
+        enqueue(&store, rollover);
+        store.unhold_flush();
+        store.wait().await;
+
+        let snapshots = store.inspect_blocks();
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.state == crate::BlockState::Evictable && snapshot.live_entries == 2)
+            .cloned()
+            .unwrap_or_else(|| panic!("no full evictable block in {snapshots:#?}"));
+        assert_eq!(snapshot.generation, 1);
+
+        assert_eq!(
+            store.force_reclaim(snapshot.id, snapshot.generation + 1).await,
+            Err(ForceReclaimError::StaleGeneration {
+                expected: snapshot.generation + 1,
+                actual: snapshot.generation,
+            })
+        );
+        store.force_reclaim(snapshot.id, snapshot.generation).await.unwrap();
+
+        assert!(store.inspect_entry(first_hash).await.unwrap().is_none());
+        assert!(store.inspect_entry(second_hash).await.unwrap().is_none());
+        let removed_hashes = listener
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                StorageEvent::EntryRemoved {
+                    hash,
+                    reason: StorageRemovalReason::Reclaimed,
+                    ..
+                } => Some(*hash),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(removed_hashes, HashSet::from([first_hash, second_hash]));
+        let reclaimed = store
+            .inspect_blocks()
+            .into_iter()
+            .find(|block| block.id == snapshot.id)
+            .unwrap();
+        assert_eq!(reclaimed.state, crate::BlockState::Clean);
+        assert_eq!(reclaimed.generation, snapshot.generation);
+        assert_eq!(reclaimed.live_entries, 0);
     }
 
     #[test_log::test(tokio::test)]
@@ -1065,6 +1576,18 @@ mod tests {
         drop(store);
 
         let store = engine_for_test(dir.path()).await;
+
+        let recovered_page = store.inspect_entries_page(0, 100).await.unwrap();
+        assert_eq!(recovered_page.total, 4);
+        assert_eq!(recovered_page.entries.len(), 4);
+        assert_eq!(
+            store
+                .inspect_blocks()
+                .iter()
+                .map(|block| block.live_entries)
+                .sum::<usize>(),
+            4
+        );
 
         assert!(store.load(memory.hash(&1)).await.unwrap().kv().is_none());
         assert!(store.load(memory.hash(&2)).await.unwrap().kv().is_none());

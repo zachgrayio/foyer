@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{borrow::Cow, fmt::Debug, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, sync::Arc, time::Duration};
 
 #[cfg(feature = "tracing")]
 use foyer_common::tracing::TracingOptions;
@@ -23,7 +23,7 @@ use foyer_common::{
     metrics::Metrics,
     spawn::Spawner,
 };
-use foyer_memory::{Cache, CacheBuilder, EvictionConfig, Filter, Weighter};
+use foyer_memory::{Cache, CacheBuilder, EvictionConfig, Filter, MemoryEventListener, Weighter};
 use foyer_storage::{Compression, EngineConfig, IoEngineConfig, RecoverMode, StoreBuilder};
 use mixtrics::{metrics::BoxedRegistry, registry::noop::NoopMetricsRegistry};
 
@@ -36,6 +36,7 @@ pub struct HybridCacheBuilder<K, V> {
     name: Cow<'static, str>,
     options: HybridCacheOptions,
     event_listener: Option<Arc<dyn EventListener<Key = K, Value = V>>>,
+    memory_event_listener: Option<Arc<dyn MemoryEventListener<K>>>,
     registry: BoxedRegistry,
 }
 
@@ -52,6 +53,7 @@ impl<K, V> HybridCacheBuilder<K, V> {
             name: "foyer".into(),
             options: HybridCacheOptions::default(),
             event_listener: None,
+            memory_event_listener: None,
             registry: Box::new(NoopMetricsRegistry),
         }
     }
@@ -81,6 +83,12 @@ impl<K, V> HybridCacheBuilder<K, V> {
     /// Default: No event listener installed.
     pub fn with_event_listener(mut self, event_listener: Arc<dyn EventListener<Key = K, Value = V>>) -> Self {
         self.event_listener = Some(event_listener);
+        self
+    }
+
+    /// Set the non-blocking memory inspection event listener.
+    pub fn with_memory_event_listener(mut self, listener: Arc<dyn MemoryEventListener<K>>) -> Self {
+        self.memory_event_listener = Some(listener);
         self
     }
 
@@ -123,6 +131,9 @@ impl<K, V> HybridCacheBuilder<K, V> {
             .with_metrics(metrics.clone());
         if let Some(event_listener) = self.event_listener {
             builder = builder.with_event_listener(event_listener);
+        }
+        if let Some(memory_event_listener) = self.memory_event_listener {
+            builder = builder.with_memory_event_listener(memory_event_listener);
         }
         HybridCacheBuilderPhaseMemory {
             name: self.name,
@@ -215,6 +226,17 @@ where
     /// and it will be immediately reclaimed when the cache entry is dropped.
     pub fn with_filter(self, filter: impl Filter<K, V>) -> Self {
         let builder = self.builder.with_filter(filter);
+        HybridCacheBuilderPhaseMemory {
+            name: self.name,
+            options: self.options,
+            metrics: self.metrics,
+            builder,
+        }
+    }
+
+    /// Set the minimum interval between reported memory accesses for one resident record.
+    pub fn with_memory_access_report_interval(self, interval: Duration) -> Self {
+        let builder = self.builder.with_memory_access_report_interval(interval);
         HybridCacheBuilderPhaseMemory {
             name: self.name,
             options: self.options,

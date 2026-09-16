@@ -22,5 +22,8 @@ pub use crate::{
         RequiredFetchBuilderErased, Waiter,
     },
     pipe::{Piece, Pipe},
-    raw::{Filter, Weighter},
+    raw::{
+        Filter, MemoryEntrySnapshot, MemoryEvent, MemoryEventListener, MemoryRemovalReason, MemorySnapshotCursor,
+        MemorySnapshotPage, Weighter,
+    },
 };

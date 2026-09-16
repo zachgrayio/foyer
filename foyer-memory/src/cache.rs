@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{any::Any, borrow::Cow, fmt::Debug, future::Future, hash::Hash, ops::Deref, sync::Arc};
+use std::{any::Any, borrow::Cow, fmt::Debug, future::Future, hash::Hash, ops::Deref, sync::Arc, time::Duration};
 
 use equivalent::Equivalent;
 use foyer_common::{
@@ -38,7 +38,10 @@ use crate::{
     indexer::hash_table::HashTableIndexer,
     inflight::{OptionalFetchBuilder, RequiredFetchBuilder},
     pipe::ArcPipe,
-    raw::{Filter, RawCache, RawCacheConfig, RawCacheEntry, RawGetOrFetch, Weighter},
+    raw::{
+        Filter, MemoryEntrySnapshot, MemoryEventListener, MemorySnapshotCursor, MemorySnapshotPage, RawCache,
+        RawCacheConfig, RawCacheEntry, RawGetOrFetch, Weighter,
+    },
     FetchTarget, Piece,
 };
 
@@ -422,6 +425,8 @@ where
     filter: Arc<dyn Filter<K, V>>,
 
     event_listener: Option<Arc<dyn EventListener<Key = K, Value = V>>>,
+    memory_event_listener: Option<Arc<dyn MemoryEventListener<K>>>,
+    memory_access_report_interval: Duration,
 
     registry: BoxedRegistry,
     metrics: Option<Arc<Metrics>>,
@@ -445,6 +450,8 @@ where
             weighter: Arc::new(|_, _| 1),
             filter: Arc::new(|_, _| true),
             event_listener: None,
+            memory_event_listener: None,
+            memory_access_report_interval: Duration::from_secs(1),
 
             registry: Box::new(NoopMetricsRegistry),
             metrics: None,
@@ -497,6 +504,8 @@ where
             weighter: self.weighter,
             filter: self.filter,
             event_listener: self.event_listener,
+            memory_event_listener: self.memory_event_listener,
+            memory_access_report_interval: self.memory_access_report_interval,
             registry: self.registry,
             metrics: self.metrics,
         }
@@ -526,6 +535,18 @@ where
     /// Set event listener.
     pub fn with_event_listener(mut self, event_listener: Arc<dyn EventListener<Key = K, Value = V>>) -> Self {
         self.event_listener = Some(event_listener);
+        self
+    }
+
+    /// Set the non-blocking memory inspection event listener.
+    pub fn with_memory_event_listener(mut self, listener: Arc<dyn MemoryEventListener<K>>) -> Self {
+        self.memory_event_listener = Some(listener);
+        self
+    }
+
+    /// Set the minimum interval between reported accesses for one resident record.
+    pub fn with_memory_access_report_interval(mut self, interval: Duration) -> Self {
+        self.memory_access_report_interval = interval;
         self
     }
 
@@ -564,58 +585,82 @@ where
             .unwrap_or_else(|| Arc::new(Metrics::new(self.name, &self.registry)));
 
         match self.eviction_config {
-            EvictionConfig::Fifo(eviction_config) => Cache::Fifo(RawCache::new(RawCacheConfig {
-                capacity: self.capacity,
-                shards: self.shards,
-                eviction_config,
-                hash_builder: self.hash_builder,
-                weighter: self.weighter,
-                filter: self.filter,
-                event_listener: self.event_listener,
-                metrics,
-            })),
-            EvictionConfig::S3Fifo(eviction_config) => Cache::S3Fifo(RawCache::new(RawCacheConfig {
-                capacity: self.capacity,
-                shards: self.shards,
-                eviction_config,
-                hash_builder: self.hash_builder,
-                weighter: self.weighter,
-                filter: self.filter,
-                event_listener: self.event_listener,
-                metrics,
-            })),
-            EvictionConfig::Lru(eviction_config) => Cache::Lru(RawCache::new(RawCacheConfig {
-                capacity: self.capacity,
-                shards: self.shards,
-                eviction_config,
-                hash_builder: self.hash_builder,
-                weighter: self.weighter,
-                filter: self.filter,
-                event_listener: self.event_listener,
-                metrics,
-            })),
-            EvictionConfig::Lfu(eviction_config) => Cache::Lfu(RawCache::new(RawCacheConfig {
-                capacity: self.capacity,
-                shards: self.shards,
-                eviction_config,
-                hash_builder: self.hash_builder,
-                weighter: self.weighter,
-                filter: self.filter,
-                event_listener: self.event_listener,
-                metrics,
-            })),
-            EvictionConfig::Sieve(eviction_config) => Cache::Sieve(RawCache::new(RawCacheConfig {
-                capacity: self.capacity,
-                shards: self.shards,
-                eviction_config,
-                hash_builder: self.hash_builder,
-                weighter: self.weighter,
-                filter: self.filter,
-                event_listener: self.event_listener,
-                metrics,
-            })),
+            EvictionConfig::Fifo(eviction_config) => Cache::Fifo(RawCache::new_with_memory_events(
+                RawCacheConfig {
+                    capacity: self.capacity,
+                    shards: self.shards,
+                    eviction_config,
+                    hash_builder: self.hash_builder,
+                    weighter: self.weighter,
+                    filter: self.filter,
+                    event_listener: self.event_listener,
+                    metrics,
+                },
+                self.memory_event_listener,
+                duration_micros(self.memory_access_report_interval),
+            )),
+            EvictionConfig::S3Fifo(eviction_config) => Cache::S3Fifo(RawCache::new_with_memory_events(
+                RawCacheConfig {
+                    capacity: self.capacity,
+                    shards: self.shards,
+                    eviction_config,
+                    hash_builder: self.hash_builder,
+                    weighter: self.weighter,
+                    filter: self.filter,
+                    event_listener: self.event_listener,
+                    metrics,
+                },
+                self.memory_event_listener,
+                duration_micros(self.memory_access_report_interval),
+            )),
+            EvictionConfig::Lru(eviction_config) => Cache::Lru(RawCache::new_with_memory_events(
+                RawCacheConfig {
+                    capacity: self.capacity,
+                    shards: self.shards,
+                    eviction_config,
+                    hash_builder: self.hash_builder,
+                    weighter: self.weighter,
+                    filter: self.filter,
+                    event_listener: self.event_listener,
+                    metrics,
+                },
+                self.memory_event_listener,
+                duration_micros(self.memory_access_report_interval),
+            )),
+            EvictionConfig::Lfu(eviction_config) => Cache::Lfu(RawCache::new_with_memory_events(
+                RawCacheConfig {
+                    capacity: self.capacity,
+                    shards: self.shards,
+                    eviction_config,
+                    hash_builder: self.hash_builder,
+                    weighter: self.weighter,
+                    filter: self.filter,
+                    event_listener: self.event_listener,
+                    metrics,
+                },
+                self.memory_event_listener,
+                duration_micros(self.memory_access_report_interval),
+            )),
+            EvictionConfig::Sieve(eviction_config) => Cache::Sieve(RawCache::new_with_memory_events(
+                RawCacheConfig {
+                    capacity: self.capacity,
+                    shards: self.shards,
+                    eviction_config,
+                    hash_builder: self.hash_builder,
+                    weighter: self.weighter,
+                    filter: self.filter,
+                    event_listener: self.event_listener,
+                    metrics,
+                },
+                self.memory_event_listener,
+                duration_micros(self.memory_access_report_interval),
+            )),
         }
     }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
 /// In-memory cache with plug-and-play algorithms.
@@ -758,6 +803,20 @@ where
         }
     }
 
+    /// Evict one cached entry and offload it through the configured pipe.
+    pub fn evict<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        match self {
+            Cache::Fifo(cache) => cache.evict(key),
+            Cache::S3Fifo(cache) => cache.evict(key),
+            Cache::Lru(cache) => cache.evict(key),
+            Cache::Lfu(cache) => cache.evict(key),
+            Cache::Sieve(cache) => cache.evict(key),
+        }
+    }
+
     /// Get cached entry with the given key from the in-memory cache.
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::cache::get"))]
     pub fn get<Q>(&self, key: &Q) -> Option<CacheEntry<K, V, S, P>>
@@ -847,6 +906,59 @@ where
             Cache::Lru(cache) => cache.entries(),
             Cache::Lfu(cache) => cache.entries(),
             Cache::Sieve(cache) => cache.entries(),
+        }
+    }
+
+    /// Number of memory inspection events dropped by or panicking in the listener.
+    pub fn dropped_memory_events(&self) -> u64 {
+        match self {
+            Cache::Fifo(cache) => cache.dropped_memory_events(),
+            Cache::S3Fifo(cache) => cache.dropped_memory_events(),
+            Cache::Lru(cache) => cache.dropped_memory_events(),
+            Cache::Lfu(cache) => cache.dropped_memory_events(),
+            Cache::Sieve(cache) => cache.dropped_memory_events(),
+        }
+    }
+
+    /// Snapshot at most `limit` resident keys without cloning their values.
+    pub fn inspect_entries(&self, limit: usize) -> Vec<MemoryEntrySnapshot<K>>
+    where
+        K: Clone,
+    {
+        match self {
+            Cache::Fifo(cache) => cache.inspect_entries(limit),
+            Cache::S3Fifo(cache) => cache.inspect_entries(limit),
+            Cache::Lru(cache) => cache.inspect_entries(limit),
+            Cache::Lfu(cache) => cache.inspect_entries(limit),
+            Cache::Sieve(cache) => cache.inspect_entries(limit),
+        }
+    }
+
+    /// Snapshot a page of resident keys without cloning skipped values.
+    pub fn inspect_entries_page(&self, offset: usize, limit: usize) -> Vec<MemoryEntrySnapshot<K>>
+    where
+        K: Clone,
+    {
+        match self {
+            Cache::Fifo(cache) => cache.inspect_entries_page(offset, limit),
+            Cache::S3Fifo(cache) => cache.inspect_entries_page(offset, limit),
+            Cache::Lru(cache) => cache.inspect_entries_page(offset, limit),
+            Cache::Lfu(cache) => cache.inspect_entries_page(offset, limit),
+            Cache::Sieve(cache) => cache.inspect_entries_page(offset, limit),
+        }
+    }
+
+    /// Snapshot one bounded memory shard page and detect mutations between pages.
+    pub fn inspect_entries_cursor(&self, cursor: Option<MemorySnapshotCursor>, limit: usize) -> MemorySnapshotPage<K>
+    where
+        K: Clone,
+    {
+        match self {
+            Cache::Fifo(cache) => cache.inspect_entries_cursor(cursor, limit),
+            Cache::S3Fifo(cache) => cache.inspect_entries_cursor(cursor, limit),
+            Cache::Lru(cache) => cache.inspect_entries_cursor(cursor, limit),
+            Cache::Lfu(cache) => cache.inspect_entries_cursor(cursor, limit),
+            Cache::Sieve(cache) => cache.inspect_entries_cursor(cursor, limit),
         }
     }
 
@@ -1151,6 +1263,7 @@ mod tests {
     use foyer_common::error::Error;
     use futures_util::future::join_all;
     use itertools::Itertools;
+    use parking_lot::Mutex;
     use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 
     use super::*;
@@ -1161,6 +1274,72 @@ mod tests {
     const RANGE: Range<u64> = 0..1000;
     const OPS: usize = 10000;
     const CONCURRENCY: usize = 8;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RecordedMemoryEvent {
+        Upserted {
+            key: u64,
+            residency_sequence: u64,
+        },
+        Removed {
+            key: u64,
+            residency_sequence: u64,
+            reason: crate::raw::MemoryRemovalReason,
+        },
+        Accessed {
+            key: u64,
+            residency_sequence: u64,
+        },
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingMemoryEventListener {
+        events: Mutex<Vec<RecordedMemoryEvent>>,
+    }
+
+    impl MemoryEventListener<u64> for RecordingMemoryEventListener {
+        fn try_on_event(&self, event: crate::raw::MemoryEvent<'_, u64>) -> bool {
+            let event = match event {
+                crate::raw::MemoryEvent::Upserted {
+                    key,
+                    residency_sequence,
+                    ..
+                } => RecordedMemoryEvent::Upserted {
+                    key: *key,
+                    residency_sequence,
+                },
+                crate::raw::MemoryEvent::Removed {
+                    key,
+                    residency_sequence,
+                    reason,
+                    ..
+                } => RecordedMemoryEvent::Removed {
+                    key: *key,
+                    residency_sequence,
+                    reason,
+                },
+                crate::raw::MemoryEvent::Accessed {
+                    key,
+                    residency_sequence,
+                    ..
+                } => RecordedMemoryEvent::Accessed {
+                    key: *key,
+                    residency_sequence,
+                },
+            };
+            self.events.lock().push(event);
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct DroppingMemoryEventListener;
+
+    impl MemoryEventListener<u64> for DroppingMemoryEventListener {
+        fn try_on_event(&self, _: crate::raw::MemoryEvent<'_, u64>) -> bool {
+            false
+        }
+    }
 
     fn fifo() -> Cache<u64, u64> {
         CacheBuilder::new(CAPACITY)
@@ -1267,6 +1446,135 @@ mod tests {
             .collect_vec();
 
         join_all(handles).await;
+    }
+
+    #[test]
+    fn test_inspect_entries_is_bounded() {
+        let cache = fifo();
+        for key in 0..10 {
+            cache.insert(key, key + 100);
+        }
+
+        let entries = cache.inspect_entries(3);
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|entry| entry.hash == cache.hash(&entry.key)));
+        assert!(entries.iter().all(|entry| entry.weight == 1));
+        assert!(cache.inspect_entries(0).is_empty());
+    }
+
+    #[test]
+    fn test_inspect_entries_cursor_retries_mutated_shard() {
+        let cache: Cache<u64, u64> = CacheBuilder::new(10)
+            .with_shards(1)
+            .with_eviction_config(FifoConfig {})
+            .build();
+        drop(cache.insert(1, 101));
+        drop(cache.insert(2, 102));
+
+        let first = cache.inspect_entries_cursor(None, 1);
+        assert_eq!(first.entries.len(), 1);
+        assert!(!first.retry_shard);
+        drop(cache.insert(3, 103));
+
+        let retry = cache.inspect_entries_cursor(first.next_cursor, 1);
+        assert!(retry.retry_shard);
+        assert!(retry.entries.is_empty());
+
+        let mut cursor = retry.next_cursor;
+        let mut keys = vec![];
+        while let Some(current) = cursor {
+            let page = cache.inspect_entries_cursor(Some(current), 1);
+            assert!(!page.retry_shard);
+            keys.extend(page.entries.into_iter().map(|entry| entry.key));
+            cursor = page.next_cursor;
+        }
+        keys.sort_unstable();
+        assert_eq!(keys, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_memory_events_track_residency_order_and_access() {
+        let listener = Arc::new(RecordingMemoryEventListener::default());
+        let cache: Cache<u64, u64> = CacheBuilder::new(2)
+            .with_shards(1)
+            .with_eviction_config(FifoConfig {})
+            .with_memory_event_listener(listener.clone())
+            .with_memory_access_report_interval(Duration::from_secs(60))
+            .build();
+
+        drop(cache.insert(7, 70));
+        drop(cache.get(&7));
+        drop(cache.get(&7));
+        drop(cache.insert(7, 71));
+        drop(cache.remove(&7));
+
+        let events = listener.events.lock();
+        let first_sequence = match events[0] {
+            RecordedMemoryEvent::Upserted {
+                key: 7,
+                residency_sequence,
+            } => residency_sequence,
+            ref event => panic!("unexpected first event: {event:?}"),
+        };
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RecordedMemoryEvent::Accessed { key: 7, .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events[2],
+            RecordedMemoryEvent::Removed {
+                key: 7,
+                residency_sequence,
+                reason: crate::raw::MemoryRemovalReason::Replaced,
+            } if residency_sequence == first_sequence
+        ));
+        let replacement_sequence = match events[3] {
+            RecordedMemoryEvent::Upserted {
+                key: 7,
+                residency_sequence,
+            } => residency_sequence,
+            ref event => panic!("unexpected replacement event: {event:?}"),
+        };
+        assert!(replacement_sequence > first_sequence);
+        assert!(matches!(
+            events[4],
+            RecordedMemoryEvent::Removed {
+                key: 7,
+                residency_sequence,
+                reason: crate::raw::MemoryRemovalReason::Removed,
+            } if residency_sequence == replacement_sequence
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_or_fetch_emits_local_memory_upsert() {
+        let listener = Arc::new(RecordingMemoryEventListener::default());
+        let cache: Cache<u64, u64> = CacheBuilder::new(2)
+            .with_shards(1)
+            .with_memory_event_listener(listener.clone())
+            .build();
+
+        drop(cache.get_or_fetch(&42, || async { Ok::<_, Error>(420) }).await.unwrap());
+
+        assert!(matches!(
+            listener.events.lock().as_slice(),
+            [RecordedMemoryEvent::Upserted { key: 42, .. }]
+        ));
+    }
+
+    #[test]
+    fn test_memory_event_drop_is_counted() {
+        let cache: Cache<u64, u64> = CacheBuilder::new(2)
+            .with_shards(1)
+            .with_memory_event_listener(Arc::new(DroppingMemoryEventListener))
+            .build();
+
+        drop(cache.insert(1, 1));
+
+        assert_eq!(cache.dropped_memory_events(), 1);
     }
 
     #[tokio::test]

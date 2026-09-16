@@ -20,9 +20,11 @@ pub use crate::{
         block::{
             engine::BlockEngineConfig,
             eviction::{EvictionInfo, EvictionPicker, FifoPicker, InvalidRatioPicker},
-            manager::{Block, BlockStatistics},
+            manager::{Block, BlockSnapshot, BlockState, BlockStatistics, ForceReclaimError},
         },
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        DiskIndexCursor, DiskIndexEntry, DiskIndexPage, Engine, EngineBuildContext, EngineConfig, EntryAddressSnapshot,
+        InspectedEntriesPage, InspectedEntry, Load, Populated, RecoverMode, StorageEvent, StorageEventListener,
+        StorageRemovalReason,
     },
     filter::{
         conditions::{AdmitAll, EstimatedSize, RejectAll},

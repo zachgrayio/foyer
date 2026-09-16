@@ -71,6 +71,12 @@ where
         })
     }
 
+    fn iter(&self) -> impl Iterator<Item = &Arc<Record<Self::Eviction>>> {
+        self.indexer.iter().inspect(|record| {
+            strict_assert!(record.is_in_indexer());
+        })
+    }
+
     fn drain(&mut self) -> impl Iterator<Item = Arc<Record<Self::Eviction>>> {
         self.indexer.drain().inspect(|r| {
             strict_assert!(r.is_in_indexer());

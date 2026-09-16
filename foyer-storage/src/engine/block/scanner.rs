@@ -14,8 +14,9 @@
 
 use foyer_common::error::Result;
 use itertools::Itertools;
+use std::sync::{atomic::AtomicU64, Arc};
 
-use super::indexer::EntryAddress;
+use super::indexer::{unix_micros, EntryAddress};
 use crate::{
     engine::block::{buffer::BlobIndexReader, manager::Block},
     io::bytes::IoSliceMut,
@@ -77,14 +78,20 @@ impl BlockScanner {
 
         let infos = indices
             .into_iter()
-            .map(|index| EntryInfo {
-                hash: index.hash,
-                addr: EntryAddress {
-                    block: self.block.id(),
-                    offset: self.offset as u32 + index.offset,
-                    len: index.len,
-                    sequence: index.sequence,
-                },
+            .map(|index| {
+                let now = unix_micros();
+                EntryInfo {
+                    hash: index.hash,
+                    addr: EntryAddress {
+                        block: self.block.id(),
+                        offset: self.offset as u32 + index.offset,
+                        len: index.len,
+                        sequence: index.sequence,
+                        inserted_at_unix_micros: now,
+                        last_accessed_at_unix_micros: Arc::new(AtomicU64::new(now)),
+                        last_access_report_bucket: Arc::new(AtomicU64::new(0)),
+                    },
+                }
             })
             .inspect(|info| tracing::trace!(?info, "[scanner] extract entry info"))
             .collect_vec();
@@ -204,6 +211,9 @@ mod tests {
                         offset: part.blob_block_offset as u32 + index.offset,
                         len: index.len,
                         sequence: index.sequence,
+                        inserted_at_unix_micros: 0,
+                        last_accessed_at_unix_micros: Arc::new(AtomicU64::new(0)),
+                        last_access_report_bucket: Arc::new(AtomicU64::new(0)),
                     },
                 })
                 .collect_vec()

@@ -16,6 +16,7 @@ use std::{
     cell::UnsafeCell,
     fmt::Debug,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bitflags::bitflags;
@@ -48,6 +49,10 @@ where
 {
     data: Data<E>,
     state: UnsafeCell<E::State>,
+    residency_sequence: u64,
+    inserted_at_unix_micros: u64,
+    last_accessed_at_unix_micros: AtomicU64,
+    last_access_report_bucket: AtomicU64,
     /// Reference count used in the in-memory cache.
     refs: AtomicUsize,
     flags: AtomicU64,
@@ -72,11 +77,21 @@ where
     /// `state` field memory layout offset of the [`Record`].
     pub const STATE_OFFSET: usize = std::mem::offset_of!(Self, state);
 
-    /// Create a record with data.
+    /// Create a record with data and no assigned cache residency sequence.
     pub fn new(data: Data<E>) -> Self {
+        Self::new_with_residency_sequence(data, 0)
+    }
+
+    /// Create a record with data and a process-local cache residency sequence.
+    pub(crate) fn new_with_residency_sequence(data: Data<E>, residency_sequence: u64) -> Self {
+        let now = unix_micros();
         Record {
             data,
             state: Default::default(),
+            residency_sequence,
+            inserted_at_unix_micros: now,
+            last_accessed_at_unix_micros: AtomicU64::new(now),
+            last_access_report_bucket: AtomicU64::new(0),
             refs: AtomicUsize::new(0),
             flags: AtomicU64::new(0),
         }
@@ -105,6 +120,37 @@ where
     /// Get the record weight.
     pub fn weight(&self) -> usize {
         self.data.weight
+    }
+
+    /// Get the process-local sequence for this memory residency.
+    pub fn residency_sequence(&self) -> u64 {
+        self.residency_sequence
+    }
+
+    /// Get the wall-clock time when the record was created.
+    pub fn inserted_at_unix_micros(&self) -> u64 {
+        self.inserted_at_unix_micros
+    }
+
+    /// Get the wall-clock time when the record was last accessed.
+    pub fn last_accessed_at_unix_micros(&self) -> u64 {
+        self.last_accessed_at_unix_micros.load(Ordering::Relaxed)
+    }
+
+    /// Update the wall-clock time when the record was last accessed.
+    pub fn touch_access_time(&self) -> u64 {
+        let now = unix_micros();
+        self.last_accessed_at_unix_micros.store(now, Ordering::Relaxed);
+        now
+    }
+
+    /// Advance the reported access bucket, returning whether an event should be emitted.
+    pub fn advance_access_report_bucket(&self, bucket: u64) -> bool {
+        self.last_access_report_bucket
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (bucket > current).then_some(bucket)
+            })
+            .is_ok()
     }
 
     /// Get the record state wrapped with [`UnsafeCell`].
@@ -179,4 +225,13 @@ where
         );
         old - val
     }
+}
+
+fn unix_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
