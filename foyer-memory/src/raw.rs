@@ -21,7 +21,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
 };
@@ -53,6 +53,107 @@ use crate::{
     pipe::{ArcPipe, NoopPipe},
     record::{Data, Record},
 };
+
+/// A key-only snapshot of an entry currently resident in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEntrySnapshot<K> {
+    /// Hash used by the memory index.
+    pub hash: u64,
+    /// Cloned cache key; the value is never cloned.
+    pub key: K,
+    /// Process-local sequence for the current residency.
+    pub residency_sequence: u64,
+    /// Weight charged against memory capacity.
+    pub weight: usize,
+    /// Wall-clock time when the current residency began.
+    pub inserted_at_unix_micros: u64,
+    /// Wall-clock time of the latest tracked access.
+    pub last_accessed_at_unix_micros: u64,
+}
+
+/// Opaque continuation for a mutation-detecting memory scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySnapshotCursor {
+    shard: usize,
+    revision: u64,
+    offset: usize,
+}
+
+/// A bounded page from one memory-cache shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySnapshotPage<K> {
+    /// Memory shard represented by this page.
+    pub shard: usize,
+    /// Structural revision of the shard when the page was taken.
+    pub revision: u64,
+    /// Resident entries in this page.
+    pub entries: Vec<MemoryEntrySnapshot<K>>,
+    /// Continuation for the next page, or `None` after the final shard.
+    pub next_cursor: Option<MemorySnapshotCursor>,
+    /// Whether prior observations for this shard must be discarded.
+    pub retry_shard: bool,
+}
+
+/// Why an entry stopped being resident in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRemovalReason {
+    /// Evicted by the configured policy.
+    Evicted,
+    /// Replaced by a newer value.
+    Replaced,
+    /// Explicitly removed.
+    Removed,
+    /// Removed while clearing the cache.
+    Cleared,
+}
+
+/// A structural or coalesced access change in the memory cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryEvent<'a, K: ?Sized> {
+    /// A record became resident in memory.
+    Upserted {
+        /// Borrowed cache key.
+        key: &'a K,
+        /// Hash used by the memory index.
+        hash: u64,
+        /// Process-local sequence for this residency.
+        residency_sequence: u64,
+        /// Weight charged against memory capacity.
+        weight: usize,
+        /// Wall-clock time when the residency began.
+        inserted_at_unix_micros: u64,
+        /// Wall-clock time of the latest tracked access.
+        last_accessed_at_unix_micros: u64,
+    },
+    /// A record stopped being resident in memory.
+    Removed {
+        /// Borrowed cache key.
+        key: &'a K,
+        /// Hash used by the memory index.
+        hash: u64,
+        /// Process-local sequence for the removed residency.
+        residency_sequence: u64,
+        /// Cause of removal.
+        reason: MemoryRemovalReason,
+    },
+    /// A resident record was accessed in a new reporting bucket.
+    Accessed {
+        /// Borrowed cache key.
+        key: &'a K,
+        /// Hash used by the memory index.
+        hash: u64,
+        /// Process-local sequence for this residency.
+        residency_sequence: u64,
+        /// Wall-clock time of the reported access.
+        accessed_at_unix_micros: u64,
+    },
+}
+
+/// Non-blocking listener for memory inspection events.
+pub trait MemoryEventListener<K>: Send + Sync + 'static + Debug {
+    /// Attempt to deliver an event, returning `false` if it was dropped.
+    fn try_on_event(&self, event: MemoryEvent<'_, K>) -> bool;
+}
 
 /// The weighter for the in-memory cache.
 ///
@@ -100,6 +201,7 @@ where
     usage: usize,
     entries: usize,
     capacity: usize,
+    revision: u64,
 
     inflights: Arc<Mutex<InflightManager<E, S, I>>>,
 
@@ -131,6 +233,7 @@ where
 
             self.usage -= evicted.weight();
             self.entries -= 1;
+            self.revision = self.revision.wrapping_add(1);
             self.metrics.memory_entries.decrease(1);
 
             garbages.push((Event::Evict, evicted));
@@ -141,9 +244,10 @@ where
     fn emplace(
         &mut self,
         record: Arc<Record<E>>,
+        residency_sequence: u64,
         garbages: &mut Vec<(Event, Arc<Record<E>>)>,
         notifiers: &mut Vec<Notifier<Option<RawCacheEntry<E, S, I>>>>,
-    ) {
+    ) -> bool {
         *notifiers = self
             .inflights
             .lock()
@@ -159,7 +263,7 @@ where
                     .is_some_and(|resident| Arc::ptr_eq(resident, &record))
             );
             record.inc_refs(notifiers.len() + 1);
-            return;
+            return false;
         }
 
         if record.properties().phantom().unwrap_or_default() {
@@ -173,6 +277,7 @@ where
 
                 self.usage -= old.weight();
                 self.entries -= 1;
+                self.revision = self.revision.wrapping_add(1);
                 self.metrics.memory_entries.decrease(1);
 
                 garbages.push((Event::Replace, old));
@@ -180,9 +285,10 @@ where
             record.inc_refs(notifiers.len() + 1);
             garbages.push((Event::Remove, record));
             self.metrics.memory_insert.increase(1);
-            return;
+            return false;
         }
 
+        record.begin_residency(residency_sequence);
         let weight = record.weight();
         let old_usage = self.usage;
 
@@ -215,6 +321,7 @@ where
         strict_assert!(record.is_in_eviction());
 
         self.usage += weight;
+        self.revision = self.revision.wrapping_add(1);
         // Increase the reference count within the lock section.
         // The reference count of the new record must be at the moment.
         record.inc_refs(notifiers.len() + 1);
@@ -224,6 +331,7 @@ where
             std::cmp::Ordering::Less => self.metrics.memory_usage.decrease((old_usage - self.usage) as _),
             std::cmp::Ordering::Equal => {}
         }
+        true
     }
 
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::raw::shard::remove"))]
@@ -241,6 +349,7 @@ where
 
         self.usage -= record.weight();
         self.entries -= 1;
+        self.revision = self.revision.wrapping_add(1);
 
         self.metrics.memory_remove.increase(1);
         self.metrics.memory_usage.decrease(record.weight() as _);
@@ -322,6 +431,7 @@ where
 
         self.entries = 0;
         if count > 0 {
+            self.revision = self.revision.wrapping_add(1);
             self.metrics.memory_entries.decrease(count);
             self.metrics.memory_remove.increase(count);
         }
@@ -387,9 +497,11 @@ where
             usage,
             entries,
             metrics,
+            revision,
             ..
         } = self;
 
+        let mut changed = false;
         for record in indexer.extract_if(|record| predicate(record.key(), record.value())) {
             if record.is_in_eviction() {
                 eviction.remove(&record);
@@ -402,8 +514,12 @@ where
             metrics.memory_evict.increase(1);
             metrics.memory_usage.decrease(record.weight() as _);
             metrics.memory_entries.decrease(1);
+            changed = true;
 
             garbages.push((Event::Evict, record));
+        }
+        if changed {
+            *revision = revision.wrapping_add(1);
         }
     }
 }
@@ -424,6 +540,10 @@ where
 
     metrics: Arc<Metrics>,
     event_listener: Option<Arc<dyn EventListener<Key = E::Key, Value = E::Value>>>,
+    memory_event_listener: Option<Arc<dyn MemoryEventListener<E::Key>>>,
+    memory_events_dropped: AtomicU64,
+    memory_access_report_interval_micros: u64,
+    next_residency_sequence: AtomicU64,
 }
 
 impl<E, S, I> RawCacheInner<E, S, I>
@@ -432,6 +552,59 @@ where
     S: HashBuilder,
     I: Indexer<Eviction = E>,
 {
+    fn emit_memory_event(&self, event: MemoryEvent<'_, E::Key>) {
+        let Some(listener) = self.memory_event_listener.as_ref() else {
+            return;
+        };
+        let delivered =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener.try_on_event(event))).unwrap_or(false);
+        if !delivered {
+            self.memory_events_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn emit_memory_removed(&self, event: Event, record: &Record<E>) {
+        let reason = match event {
+            Event::Evict => MemoryRemovalReason::Evicted,
+            Event::Replace => MemoryRemovalReason::Replaced,
+            Event::Remove => MemoryRemovalReason::Removed,
+            Event::Clear => MemoryRemovalReason::Cleared,
+        };
+        self.emit_memory_event(MemoryEvent::Removed {
+            key: record.key(),
+            hash: record.hash(),
+            residency_sequence: record.residency_sequence(),
+            reason,
+        });
+    }
+
+    fn emit_memory_upserted(&self, record: &Record<E>) {
+        self.emit_memory_event(MemoryEvent::Upserted {
+            key: record.key(),
+            hash: record.hash(),
+            residency_sequence: record.residency_sequence(),
+            weight: record.weight(),
+            inserted_at_unix_micros: record.inserted_at_unix_micros(),
+            last_accessed_at_unix_micros: record.last_accessed_at_unix_micros(),
+        });
+    }
+
+    fn touch_and_report_access(&self, record: &Record<E>) {
+        if self.memory_event_listener.is_none() {
+            return;
+        }
+        let accessed_at_unix_micros = record.touch_access_time();
+        let bucket = accessed_at_unix_micros / self.memory_access_report_interval_micros;
+        if record.advance_access_report_bucket(bucket) {
+            self.emit_memory_event(MemoryEvent::Accessed {
+                key: record.key(),
+                hash: record.hash(),
+                residency_sequence: record.residency_sequence(),
+                accessed_at_unix_micros,
+            });
+        }
+    }
+
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::raw::inner::clear"))]
     fn clear(&self) {
         let mut garbages = vec![];
@@ -442,8 +615,9 @@ where
             .for_each(|mut shard| shard.clear(&mut garbages));
 
         // Do not deallocate data within the lock section.
-        if let Some(listener) = self.event_listener.as_ref() {
-            for record in garbages {
+        for record in garbages {
+            self.emit_memory_removed(Event::Clear, &record);
+            if let Some(listener) = self.event_listener.as_ref() {
                 listener.on_leave(Event::Clear, record.key(), record.value());
             }
         }
@@ -492,6 +666,14 @@ where
     I: Indexer<Eviction = E>,
 {
     pub fn new(config: RawCacheConfig<E, S>) -> Self {
+        Self::new_with_memory_events(config, None, 1_000_000)
+    }
+
+    pub(crate) fn new_with_memory_events(
+        config: RawCacheConfig<E, S>,
+        memory_event_listener: Option<Arc<dyn MemoryEventListener<E::Key>>>,
+        memory_access_report_interval_micros: u64,
+    ) -> Self {
         assert!(config.shards > 0, "shards must be greater than zero.");
 
         let shard_capacities = (0..config.shards)
@@ -506,6 +688,7 @@ where
                 usage: 0,
                 entries: 0,
                 capacity: shard_capacity,
+                revision: 0,
                 inflights: Arc::new(Mutex::new(InflightManager::new())),
                 metrics: config.metrics.clone(),
                 _event_listener: config.event_listener.clone(),
@@ -523,6 +706,10 @@ where
                 filter: config.filter,
                 metrics: config.metrics,
                 event_listener: config.event_listener,
+                memory_event_listener,
+                memory_events_dropped: AtomicU64::new(0),
+                memory_access_report_interval_micros: memory_access_report_interval_micros.max(1),
+                next_residency_sequence: AtomicU64::new(1),
             }),
         }
     }
@@ -552,8 +739,9 @@ where
                     });
                     // Deallocate data out of the lock critical section.
                     let piped = pipe.is_enabled();
-                    if inner.event_listener.is_some() || piped {
+                    if inner.event_listener.is_some() || inner.memory_event_listener.is_some() || piped {
                         for (event, record) in garbages {
+                            inner.emit_memory_removed(event, &record);
                             if let Some(listener) = inner.event_listener.as_ref() {
                                 listener.on_leave(event, record.key(), record.value())
                             }
@@ -639,10 +827,11 @@ where
     fn insert_inner(&self, record: Arc<Record<E>>, source: Source) -> RawCacheEntry<E, S, I> {
         let mut garbages = vec![];
         let mut notifiers = vec![];
+        let residency_sequence = self.inner.next_residency_sequence.fetch_add(1, Ordering::Relaxed);
 
-        self.inner.shards[self.shard(record.hash())]
+        let admitted = self.inner.shards[self.shard(record.hash())]
             .write()
-            .with(|mut shard| shard.emplace(record.clone(), &mut garbages, &mut notifiers));
+            .with(|mut shard| shard.emplace(record.clone(), residency_sequence, &mut garbages, &mut notifiers));
 
         // Notify waiters out of the lock critical section.
         for notifier in notifiers {
@@ -656,8 +845,9 @@ where
 
         // Deallocate data out of the lock critical section.
         let piped = self.pipe.is_enabled();
-        if self.inner.event_listener.is_some() || piped {
+        if self.inner.event_listener.is_some() || self.inner.memory_event_listener.is_some() || piped {
             for (event, record) in garbages {
+                self.inner.emit_memory_removed(event, &record);
                 if let Some(listener) = self.inner.event_listener.as_ref() {
                     listener.on_leave(event, record.key(), record.value())
                 }
@@ -665,6 +855,9 @@ where
                     self.pipe.send(Piece::new(record));
                 }
             }
+        }
+        if admitted {
+            self.inner.emit_memory_upserted(&record);
         }
 
         RawCacheEntry {
@@ -685,8 +878,9 @@ where
 
         // Deallocate data out of the lock critical section.
         let piped = self.pipe.is_enabled();
-        if self.inner.event_listener.is_some() || piped {
+        if self.inner.event_listener.is_some() || self.inner.memory_event_listener.is_some() || piped {
             for (event, record) in garbages {
+                self.inner.emit_memory_removed(event, &record);
                 if let Some(listener) = self.inner.event_listener.as_ref() {
                     listener.on_leave(event, record.key(), record.value())
                 }
@@ -715,8 +909,9 @@ where
         // Deallocate data out of the lock critical section.
         let piped = self.pipe.is_enabled();
 
-        if let Some(listener) = self.inner.event_listener.as_ref() {
-            for (event, record) in garbages.iter() {
+        for (event, record) in garbages.iter() {
+            self.inner.emit_memory_removed(*event, record);
+            if let Some(listener) = self.inner.event_listener.as_ref() {
                 listener.on_leave(*event, record.key(), record.value());
             }
         }
@@ -745,10 +940,41 @@ where
             })
             .inspect(|record| {
                 // Deallocate data out of the lock critical section.
+                self.inner.emit_memory_removed(Event::Remove, &record.record);
                 if let Some(listener) = self.inner.event_listener.as_ref() {
                     listener.on_leave(Event::Remove, record.key(), record.value());
                 }
             })
+    }
+
+    /// Evict one cached entry and offload it through the configured pipe.
+    #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::raw::evict"))]
+    pub fn evict<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Equivalent<E::Key> + ?Sized,
+    {
+        let hash = self.inner.hash_builder.hash_one(key);
+        let Some(record) = self.inner.shards[self.shard(hash)]
+            .write()
+            .with(|mut shard| shard.remove(hash, key))
+        else {
+            return false;
+        };
+
+        self.inner.emit_memory_removed(Event::Evict, &record);
+        if let Some(listener) = self.inner.event_listener.as_ref() {
+            listener.on_leave(Event::Evict, record.key(), record.value());
+        }
+        if self.pipe.is_enabled() {
+            self.pipe.send_force(Piece::new(record.clone()));
+        }
+        drop(RawCacheEntry {
+            pipe: self.pipe.clone(),
+            inner: self.inner.clone(),
+            record,
+            source: Source::Memory,
+        });
+        true
     }
 
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::raw::get"))]
@@ -767,6 +993,7 @@ where
                 .write()
                 .with(|mut shard| shard.get_mutable(hash, key)),
         }?;
+        self.inner.touch_and_report_access(&record);
 
         Some(RawCacheEntry {
             pipe: self.pipe.clone(),
@@ -795,7 +1022,7 @@ where
     {
         let hash = self.inner.hash_builder.hash_one(key);
 
-        match E::acquire() {
+        let record = match E::acquire() {
             Op::Noop => self.inner.shards[self.shard(hash)].read().get_noop(hash, key),
             Op::Immutable(_) => self.inner.shards[self.shard(hash)]
                 .read()
@@ -803,8 +1030,11 @@ where
             Op::Mutable(_) => self.inner.shards[self.shard(hash)]
                 .write()
                 .with(|mut shard| shard.get_mutable(hash, key)),
+        };
+        if let Some(record) = &record {
+            self.inner.touch_and_report_access(record);
         }
-        .is_some()
+        record.is_some()
     }
 
     #[cfg_attr(feature = "tracing", fastrace::trace(name = "foyer::memory::raw::clear"))]
@@ -822,6 +1052,122 @@ where
 
     pub fn entries(&self) -> usize {
         self.inner.shards.iter().map(|shard| shard.read().entries).sum()
+    }
+
+    pub fn inspect_entries(&self, limit: usize) -> Vec<MemoryEntrySnapshot<E::Key>>
+    where
+        E::Key: Clone,
+    {
+        self.inspect_entries_page(0, limit)
+    }
+
+    pub fn inspect_entries_page(&self, offset: usize, limit: usize) -> Vec<MemoryEntrySnapshot<E::Key>>
+    where
+        E::Key: Clone,
+    {
+        let mut entries = Vec::with_capacity(limit.min(self.entries().saturating_sub(offset)));
+        let mut skipped = 0;
+        for shard in &self.inner.shards {
+            if entries.len() == limit {
+                break;
+            }
+            shard.read().with(|shard| {
+                for record in shard.indexer.iter() {
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    if entries.len() == limit {
+                        break;
+                    }
+                    entries.push(Self::snapshot(record));
+                }
+            });
+        }
+        entries
+    }
+
+    pub fn inspect_entries_cursor(
+        &self,
+        cursor: Option<MemorySnapshotCursor>,
+        limit: usize,
+    ) -> MemorySnapshotPage<E::Key>
+    where
+        E::Key: Clone,
+    {
+        assert!(limit > 0, "memory snapshot page limit must be greater than zero");
+        let shard_index = cursor.as_ref().map_or(0, |cursor| cursor.shard);
+        let shard = self.inner.shards[shard_index].read();
+        let revision = shard.revision;
+        let offset = match cursor {
+            Some(cursor) if cursor.revision != revision => {
+                return MemorySnapshotPage {
+                    shard: shard_index,
+                    revision,
+                    entries: vec![],
+                    next_cursor: Some(MemorySnapshotCursor {
+                        shard: shard_index,
+                        revision,
+                        offset: 0,
+                    }),
+                    retry_shard: true,
+                };
+            }
+            Some(cursor) => cursor.offset,
+            None => 0,
+        };
+        let mut entries = shard
+            .indexer
+            .iter()
+            .skip(offset)
+            .take(limit + 1)
+            .map(Self::snapshot)
+            .collect_vec();
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        let next_cursor = if has_more {
+            Some(MemorySnapshotCursor {
+                shard: shard_index,
+                revision,
+                offset: offset + entries.len(),
+            })
+        } else if shard_index + 1 < self.inner.shards.len() {
+            let next_shard = shard_index + 1;
+            let revision = self.inner.shards[next_shard].read().revision;
+            Some(MemorySnapshotCursor {
+                shard: next_shard,
+                revision,
+                offset: 0,
+            })
+        } else {
+            None
+        };
+        MemorySnapshotPage {
+            shard: shard_index,
+            revision,
+            entries,
+            next_cursor,
+            retry_shard: false,
+        }
+    }
+
+    fn snapshot(record: &Arc<Record<E>>) -> MemoryEntrySnapshot<E::Key>
+    where
+        E::Key: Clone,
+    {
+        MemoryEntrySnapshot {
+            hash: record.hash(),
+            key: record.key().clone(),
+            residency_sequence: record.residency_sequence(),
+            weight: record.weight(),
+            inserted_at_unix_micros: record.inserted_at_unix_micros(),
+            last_accessed_at_unix_micros: record.last_accessed_at_unix_micros(),
+        }
+    }
+
+    /// Number of events rejected by or panicking in the memory listener.
+    pub fn dropped_memory_events(&self) -> u64 {
+        self.inner.memory_events_dropped.load(Ordering::Relaxed)
     }
 
     pub fn metrics(&self) -> &Metrics {
@@ -1081,6 +1427,7 @@ where
         // Make sure cache query and inflight query are in the same lock critical section.
         let extract = |key: &Q, opt: Option<Arc<Record<E>>>, inflights: &Arc<Mutex<InflightManager<E, S, I>>>| {
             opt.map(|record| {
+                self.inner.touch_and_report_access(&record);
                 RawGetOrFetch::Hit(Some(RawCacheEntry {
                     pipe: self.pipe.clone(),
                     inner: self.inner.clone(),

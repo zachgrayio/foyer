@@ -94,6 +94,10 @@ where
         }
     }
 
+    fn iter(&self) -> impl Iterator<Item = &Arc<Record<Self::Eviction>>> {
+        self.table.iter()
+    }
+
     fn drain(&mut self) -> impl Iterator<Item = Arc<Record<Self::Eviction>>> {
         self.table.drain()
     }

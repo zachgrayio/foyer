@@ -150,6 +150,11 @@ pub trait Pipe: Send + Sync + 'static + Debug {
     /// Send the piece to the disk cache.
     fn send(&self, piece: Piece<Self::Key, Self::Value, Self::Properties>);
 
+    /// Send an explicitly selected piece to the disk cache without admission filtering.
+    fn send_force(&self, piece: Piece<Self::Key, Self::Value, Self::Properties>) {
+        self.send(piece);
+    }
+
     /// Flush all the pieces to the disk cache in an asynchronous manner.
     ///
     /// This function is called when the in-memory cache is flushed.

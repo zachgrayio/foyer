@@ -34,6 +34,7 @@ use crate::{
         scanner::BlockScanner,
         serde::Sequence,
     },
+    engine::{EntryAddressSnapshot, StorageEvent, StorageEventObserver, StorageRemovalReason},
     io::{
         PAGE,
         bytes::{IoSlice, IoSliceMut},
@@ -56,6 +57,7 @@ where
     blob_index_size: usize,
     statistics: Arc<Statistics>,
     spawner: Spawner,
+    observer: StorageEventObserver,
 }
 
 impl<K, V, P> Debug for Reclaimer<K, V, P>
@@ -82,6 +84,7 @@ where
         blob_index_size: usize,
         statistics: Arc<Statistics>,
         spawner: Spawner,
+        observer: StorageEventObserver,
     ) -> Self {
         Self {
             indexer,
@@ -90,6 +93,7 @@ where
             blob_index_size,
             statistics,
             spawner,
+            observer,
         }
     }
 }
@@ -107,8 +111,10 @@ where
         let flushers = self.flushers.clone();
         let spawner = self.spawner.clone();
         let indexer = self.indexer.clone();
+        let observer = self.observer.clone();
         async move {
             let id = block.id();
+            let reinsert = block.reinsert();
 
             tracing::debug!(id, "[reclaimer]: Start reclaiming block.");
 
@@ -135,7 +141,7 @@ where
                     Ok(Some(infos)) => infos,
                 };
                 for info in infos {
-                    if reinsertion_picker.filter(&statistics, info.hash, info.addr.len as _).is_admitted() {
+                    if reinsert && reinsertion_picker.filter(&statistics, info.hash, info.addr.len as _).is_admitted() {
                         let buf = IoSliceMut::new(bits::align_up(PAGE, info.addr.len as _));
                         let (buf, res) = block.read(Box::new(buf), info.addr.offset as _).await;
                         if let Err(e) = res {
@@ -169,7 +175,13 @@ where
             spawner.spawn(async move {
                 join_all(waits).await;
             });
-            indexer.remove_batch(unpicked);
+            for entry in indexer.remove_batch_hashed(unpicked) {
+                observer.emit(StorageEvent::EntryRemoved {
+                    hash: entry.hash,
+                    address: EntryAddressSnapshot::from(entry.address),
+                    reason: StorageRemovalReason::Reclaimed,
+                });
+            }
 
             if let Err(e) = BlockCleaner::clean(&block).await {
                 tracing::warn!("reclaimer]: mark block {id} clean error: {e}", id = block.id());

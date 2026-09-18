@@ -28,6 +28,7 @@ pub trait Indexer: Send + Sync + 'static + Default {
     fn remove<Q>(&mut self, hash: u64, key: &Q) -> Option<Arc<Record<Self::Eviction>>>
     where
         Q: Hash + Equivalent<<Self::Eviction as Eviction>::Key> + ?Sized;
+    fn iter(&self) -> impl Iterator<Item = &Arc<Record<Self::Eviction>>>;
     fn drain(&mut self) -> impl Iterator<Item = Arc<Record<Self::Eviction>>>;
 }
 

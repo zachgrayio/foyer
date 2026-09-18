@@ -40,8 +40,14 @@ use foyer_common::{
     properties::{Age, Hint, Location, Properties, Source},
     rate::RateLimiter,
 };
-use foyer_memory::{Cache, CacheEntry, FetchTarget, GetOrFetch, Piece, Pipe};
-use foyer_storage::{Load, Populated, Statistics, Store};
+use foyer_memory::{
+    Cache, CacheEntry, FetchTarget, GetOrFetch, MemoryEntrySnapshot, MemorySnapshotCursor, MemorySnapshotPage, Piece,
+    Pipe,
+};
+use foyer_storage::{
+    BlockSnapshot, DiskIndexCursor, DiskIndexPage, EntryAddressSnapshot, ForceReclaimError, InspectedEntriesPage,
+    InspectedEntry, Load, Populated, Statistics, Store,
+};
 use futures_util::FutureExt as _;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
@@ -234,6 +240,10 @@ where
             Location::Default | Location::OnDisk => {}
         }
         self.store.enqueue(piece, false);
+    }
+
+    fn send_force(&self, piece: Piece<Self::Key, Self::Value, HybridCacheProperties>) {
+        self.store.enqueue(piece, true);
     }
 
     fn flush(
@@ -661,6 +671,110 @@ where
     /// Return `false` if the hybrid cache is running in in-memory mode but with hybrid cache compatible APIs.
     pub fn is_hybrid(&self) -> bool {
         self.inner.storage.is_enabled()
+    }
+
+    /// Snapshot disk block lifecycle and occupancy information.
+    pub fn inspect_blocks(&self) -> Option<Vec<BlockSnapshot>> {
+        self.inner.storage.inspect_blocks()
+    }
+
+    /// Snapshot at most `limit` keys currently resident in memory.
+    pub fn inspect_memory_entries(&self, limit: usize) -> Vec<MemoryEntrySnapshot<K>>
+    where
+        K: Clone,
+    {
+        self.inner.memory.inspect_entries(limit)
+    }
+
+    /// Snapshot a page of keys currently resident in memory.
+    pub fn inspect_memory_entries_page(&self, offset: usize, limit: usize) -> Vec<MemoryEntrySnapshot<K>>
+    where
+        K: Clone,
+    {
+        self.inner.memory.inspect_entries_page(offset, limit)
+    }
+
+    /// Snapshot one bounded memory shard page and detect mutations between pages.
+    pub fn inspect_memory_entries_cursor(
+        &self,
+        cursor: Option<MemorySnapshotCursor>,
+        limit: usize,
+    ) -> MemorySnapshotPage<K>
+    where
+        K: Clone,
+    {
+        self.inner.memory.inspect_entries_cursor(cursor, limit)
+    }
+
+    /// Evict one resident memory entry, applying the configured hybrid cache policy.
+    pub fn evict_memory<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.memory.evict(key)
+    }
+
+    /// Locate `key` on disk after verifying the decoded key against hash collisions.
+    pub async fn inspect_entry<Q>(&self, key: &Q) -> Result<Option<InspectedEntry<K>>>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.storage.inspect_entry(key).await
+    }
+
+    /// Decode the entry at an expected live disk address.
+    pub async fn inspect_disk_entry_at(
+        &self,
+        hash: u64,
+        address: EntryAddressSnapshot,
+    ) -> Result<Option<InspectedEntry<K>>> {
+        self.inner.storage.inspect_entry_at(hash, address).await
+    }
+
+    /// Snapshot the indexed disk address for `key` without reading its encoded key.
+    pub fn inspect_disk_address<Q>(&self, key: &Q) -> Option<EntryAddressSnapshot>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.storage.inspect_address(key)
+    }
+
+    /// Inspect one mutation-detecting page of raw live disk addresses.
+    pub fn inspect_disk_index_page(&self, cursor: Option<DiskIndexCursor>, limit: usize) -> Option<DiskIndexPage> {
+        self.inner.storage.inspect_disk_index_page(cursor, limit)
+    }
+
+    /// Inspect a bounded page of live decoded disk entries.
+    pub async fn inspect_disk_entries_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<InspectedEntriesPage<K>>> {
+        self.inner.storage.inspect_entries_page(offset, limit).await
+    }
+
+    /// Inspect all live decoded keys currently indexed in `block`.
+    pub async fn inspect_block(&self, block: u32) -> Result<Option<Vec<InspectedEntry<K>>>> {
+        self.inner.storage.inspect_block(block).await
+    }
+
+    /// Reclaim an exact disk block if its process-local generation still matches.
+    pub async fn force_reclaim(
+        &self,
+        block: u32,
+        expected_generation: u64,
+    ) -> std::result::Result<(), ForceReclaimError> {
+        self.inner.storage.force_reclaim(block, expected_generation).await
+    }
+
+    /// Return the number of structural storage events rejected by the listener.
+    pub fn dropped_inspection_events(&self) -> u64 {
+        self.inner.storage.dropped_inspection_events()
+    }
+
+    /// Return the number of memory inspection events rejected by the listener.
+    pub fn dropped_memory_events(&self) -> u64 {
+        self.inner.memory.dropped_memory_events()
     }
 
     pub(crate) fn metrics(&self) -> &Arc<Metrics> {
@@ -1300,6 +1414,26 @@ mod tests {
         assert_eq!(
             hybrid.storage().load(&3).await.unwrap().entry().unwrap().1,
             vec![3; 7 * KB]
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_force_memory_eviction_writes_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let hybrid = open_with(dir.path(), |builder| builder, |builder| builder).await;
+        let entry = hybrid.insert_with_properties(
+            1,
+            vec![1; 7 * KB],
+            HybridCacheProperties::default().with_location(Location::InMem),
+        );
+        drop(entry);
+
+        assert!(hybrid.evict_memory(&1));
+        assert!(hybrid.memory().get(&1).is_none());
+        hybrid.storage().wait().await;
+        assert_eq!(
+            hybrid.storage().load(&1).await.unwrap().entry().unwrap().1,
+            vec![1; 7 * KB]
         );
     }
 

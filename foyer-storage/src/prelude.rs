@@ -17,11 +17,13 @@ pub use crate::io::engine::uring::{UringIoEngine, UringIoEngineConfig};
 pub use crate::{
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        DiskIndexCursor, DiskIndexEntry, DiskIndexPage, Engine, EngineBuildContext, EngineConfig, EntryAddressSnapshot,
+        InspectedEntriesPage, InspectedEntry, Load, Populated, RecoverMode, StorageEvent, StorageEventListener,
+        StorageRemovalReason,
         block::{
             engine::BlockEngineConfig,
             eviction::{EvictionInfo, EvictionPicker, FifoPicker, InvalidRatioPicker},
-            manager::{Block, BlockStatistics},
+            manager::{Block, BlockSnapshot, BlockState, BlockStatistics, ForceReclaimError},
         },
     },
     filter::{

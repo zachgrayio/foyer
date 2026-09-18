@@ -12,7 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{
+    any::Any,
+    fmt::Debug,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use foyer_common::{
     code::{StorageKey, StorageValue},
@@ -25,6 +32,189 @@ use foyer_memory::Piece;
 use futures_core::future::BoxFuture;
 
 use crate::{Device, filter::StorageFilterResult, io::engine::IoEngine, keeper::PieceRef};
+
+use self::block::manager::{BlockSnapshot, ForceReclaimError};
+
+/// A value-only snapshot of an entry's current disk address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryAddressSnapshot {
+    /// Block containing the entry.
+    pub block: u32,
+    /// Byte offset within the block.
+    pub offset: u32,
+    /// Unaligned serialized entry length.
+    pub len: u32,
+    /// Monotonic entry version used to reject stale addresses.
+    pub sequence: u64,
+    /// Wall-clock time when this process observed the address.
+    pub inserted_at_unix_micros: u64,
+    /// Wall-clock time when this address was last loaded.
+    pub last_accessed_at_unix_micros: u64,
+}
+
+/// Opaque continuation for a mutation-detecting disk-index scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskIndexCursor {
+    pub(crate) shard: usize,
+    pub(crate) revision: u64,
+    pub(crate) offset: usize,
+}
+
+/// A live hash/address pair from the disk index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskIndexEntry {
+    /// Indexed key hash.
+    pub hash: u64,
+    /// Current disk address.
+    pub address: EntryAddressSnapshot,
+}
+
+/// A bounded page from one disk-index shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskIndexPage {
+    /// Disk-index shard represented by this page.
+    pub shard: usize,
+    /// Structural revision when this page was taken.
+    pub revision: u64,
+    /// Live addresses in this page.
+    pub entries: Vec<DiskIndexEntry>,
+    /// Continuation for the next page, or `None` after the final shard.
+    pub next_cursor: Option<DiskIndexCursor>,
+    /// Whether prior observations for this shard must be discarded.
+    pub retry_shard: bool,
+}
+
+impl From<block::indexer::EntryAddress> for EntryAddressSnapshot {
+    fn from(address: block::indexer::EntryAddress) -> Self {
+        Self {
+            block: address.block,
+            offset: address.offset,
+            len: address.len,
+            sequence: address.sequence,
+            inserted_at_unix_micros: address.inserted_at_unix_micros,
+            last_accessed_at_unix_micros: address.last_accessed_at_unix_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A decoded cache key and its current disk address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedEntry<K> {
+    /// Indexed key hash.
+    pub hash: u64,
+    /// Decoded cache key.
+    pub key: K,
+    /// Current physical address of the entry.
+    pub address: EntryAddressSnapshot,
+}
+
+/// A bounded page of decoded entries from the live disk index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedEntriesPage<K> {
+    /// Number of live addresses observed when the page was taken.
+    pub total: usize,
+    /// Raw index offset immediately after this page.
+    pub next_offset: usize,
+    /// Decoded entries that remained live throughout inspection.
+    pub entries: Vec<InspectedEntry<K>>,
+}
+
+/// Why a live disk index entry was removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRemovalReason {
+    /// A newer entry replaced the same hash.
+    Replaced,
+    /// The key was explicitly deleted.
+    Deleted,
+    /// The containing block was reclaimed.
+    Reclaimed,
+    /// The indexed entry failed validation while being read.
+    Invalid,
+}
+
+/// A structural change to the block storage engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageEvent {
+    /// A new address became authoritative for a key hash.
+    EntryCommitted {
+        /// Indexed key hash.
+        hash: u64,
+        /// Committed disk address.
+        address: EntryAddressSnapshot,
+    },
+    /// A live address stopped being authoritative.
+    EntryRemoved {
+        /// Indexed key hash.
+        hash: u64,
+        /// Removed disk address.
+        address: EntryAddressSnapshot,
+        /// Cause of removal.
+        reason: StorageRemovalReason,
+    },
+    /// A live disk entry was loaded in a new reporting bucket.
+    EntryAccessed {
+        /// Indexed key hash.
+        hash: u64,
+        /// Current disk address and access timestamp.
+        address: EntryAddressSnapshot,
+    },
+    /// A block changed lifecycle state.
+    BlockStateChanged {
+        /// Block identifier.
+        block: u32,
+        /// Process-local allocation generation.
+        generation: u64,
+        /// New lifecycle state.
+        state: block::manager::BlockState,
+    },
+}
+
+/// Non-blocking listener for best-effort structural storage events.
+pub trait StorageEventListener: Send + Sync + 'static + Debug {
+    /// Attempt to deliver an event, returning `false` if it was dropped.
+    fn try_on_event(&self, event: StorageEvent) -> bool;
+}
+
+#[derive(Clone)]
+pub(crate) struct StorageEventObserver {
+    listener: Option<Arc<dyn StorageEventListener>>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Debug for StorageEventObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageEventObserver")
+            .field("enabled", &self.listener.is_some())
+            .field("dropped", &self.dropped())
+            .finish()
+    }
+}
+
+impl StorageEventObserver {
+    pub(crate) fn new(listener: Option<Arc<dyn StorageEventListener>>) -> Self {
+        Self {
+            listener,
+            dropped: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn emit(&self, event: StorageEvent) {
+        let delivered = self.listener.as_ref().is_none_or(|listener| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener.try_on_event(event))).unwrap_or(false)
+        });
+        if !delivered {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
 
 /// Source context for populated entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +371,63 @@ where
     ///
     /// `contains` may return a false-positive result if there is a hash collision with the given key.
     fn may_contains(&self, hash: u64) -> bool;
+
+    /// Snapshot block lifecycle and occupancy information when supported.
+    fn inspect_blocks(&self) -> Option<Vec<BlockSnapshot>> {
+        None
+    }
+
+    /// Inspect the live entry currently indexed by `hash` when supported.
+    fn inspect_entry(&self, _hash: u64) -> BoxFuture<'static, Result<Option<InspectedEntry<K>>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Decode the entry at an expected live address when supported.
+    fn inspect_entry_at(
+        &self,
+        _hash: u64,
+        _address: EntryAddressSnapshot,
+    ) -> BoxFuture<'static, Result<Option<InspectedEntry<K>>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Snapshot the indexed address for `hash` without reading the entry key.
+    fn inspect_address(&self, _hash: u64) -> Option<EntryAddressSnapshot> {
+        None
+    }
+
+    /// Inspect one mutation-detecting page of raw live disk addresses.
+    fn inspect_disk_index_page(&self, _cursor: Option<DiskIndexCursor>, _limit: usize) -> Option<DiskIndexPage> {
+        None
+    }
+
+    /// Inspect a bounded page of decoded live entries when supported.
+    fn inspect_entries_page(
+        &self,
+        _offset: usize,
+        _limit: usize,
+    ) -> BoxFuture<'static, Result<Option<InspectedEntriesPage<K>>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Inspect all live decoded entries currently indexed in `block`.
+    fn inspect_block(&self, _block: u32) -> BoxFuture<'static, Result<Option<Vec<InspectedEntry<K>>>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Reclaim an exact block if its process-local generation still matches.
+    fn force_reclaim(
+        &self,
+        _block: u32,
+        _expected_generation: u64,
+    ) -> BoxFuture<'static, std::result::Result<(), ForceReclaimError>> {
+        Box::pin(async { Err(ForceReclaimError::Unsupported) })
+    }
+
+    /// Return the number of structural events rejected by the listener.
+    fn dropped_inspection_events(&self) -> u64 {
+        0
+    }
 
     /// Delete all cached entries of the disk cache.
     fn destroy(&self) -> BoxFuture<'static, Result<()>>;

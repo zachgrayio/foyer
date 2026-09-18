@@ -17,7 +17,7 @@ use std::sync::Arc;
 use asyncband::mutex::Mutex;
 use bytes::{Buf, BufMut};
 use foyer_common::error::Result;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 
 use crate::{
     IoEngine,
@@ -353,7 +353,7 @@ mod tests {
         for (i, tombstone) in expected.iter().enumerate() {
             let mut buf = IoSliceMut::new(PAGE);
             buf.as_mut().fill(0);
-            tombstone.write(&mut buf.as_mut()[..Tombstone::serialized_len()]);
+            tombstone.write(&mut buf.as_mut()[..Tombstone::SERIALIZED_LEN]);
             let offset = (i * TombstoneLog::RECOVER_CHUNK_SIZE) as u64;
             let (_, res) = io_engine.write(Box::new(buf), partition.as_ref(), offset).await;
             res.unwrap();

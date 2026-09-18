@@ -30,7 +30,9 @@ use crate::{
     StorageFilterResult,
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        DiskIndexCursor, DiskIndexPage, Engine, EngineBuildContext, EngineConfig, EntryAddressSnapshot,
+        InspectedEntriesPage, InspectedEntry, Load, Populated, RecoverMode,
+        block::manager::{BlockSnapshot, ForceReclaimError},
         noop::{NoopEngine, NoopEngineConfig},
     },
     io::{
@@ -265,6 +267,71 @@ where
     {
         let hash = self.inner.hasher.hash_one(key);
         self.inner.keeper.contains(hash, key) || self.inner.engine.may_contains(hash)
+    }
+
+    /// Snapshot block lifecycle and occupancy information when supported by the disk engine.
+    pub fn inspect_blocks(&self) -> Option<Vec<BlockSnapshot>> {
+        self.inner.engine.inspect_blocks()
+    }
+
+    /// Locate `key` on disk after verifying the decoded key against hash collisions.
+    pub async fn inspect_entry<Q>(&self, key: &Q) -> Result<Option<InspectedEntry<K>>>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        let hash = self.inner.hasher.hash_one(key);
+        Ok(self
+            .inner
+            .engine
+            .inspect_entry(hash)
+            .await?
+            .filter(|entry| key.equivalent(&entry.key)))
+    }
+
+    /// Decode the entry at an expected live address.
+    pub async fn inspect_entry_at(
+        &self,
+        hash: u64,
+        address: EntryAddressSnapshot,
+    ) -> Result<Option<InspectedEntry<K>>> {
+        self.inner.engine.inspect_entry_at(hash, address).await
+    }
+
+    /// Snapshot the indexed disk address for `key` without reading its encoded key.
+    pub fn inspect_address<Q>(&self, key: &Q) -> Option<EntryAddressSnapshot>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.engine.inspect_address(self.inner.hasher.hash_one(key))
+    }
+
+    /// Inspect one mutation-detecting page of raw live disk addresses.
+    pub fn inspect_disk_index_page(&self, cursor: Option<DiskIndexCursor>, limit: usize) -> Option<DiskIndexPage> {
+        self.inner.engine.inspect_disk_index_page(cursor, limit)
+    }
+
+    /// Inspect a bounded page of live decoded disk entries.
+    pub async fn inspect_entries_page(&self, offset: usize, limit: usize) -> Result<Option<InspectedEntriesPage<K>>> {
+        self.inner.engine.inspect_entries_page(offset, limit).await
+    }
+
+    /// Inspect all live decoded keys currently indexed in `block`.
+    pub async fn inspect_block(&self, block: u32) -> Result<Option<Vec<InspectedEntry<K>>>> {
+        self.inner.engine.inspect_block(block).await
+    }
+
+    /// Reclaim an exact block if its process-local generation still matches.
+    pub async fn force_reclaim(
+        &self,
+        block: u32,
+        expected_generation: u64,
+    ) -> std::result::Result<(), ForceReclaimError> {
+        self.inner.engine.force_reclaim(block, expected_generation).await
+    }
+
+    /// Return the number of structural events rejected by the configured listener.
+    pub fn dropped_inspection_events(&self) -> u64 {
+        self.inner.engine.dropped_inspection_events()
     }
 
     /// Delete all cached entries of the disk cache.

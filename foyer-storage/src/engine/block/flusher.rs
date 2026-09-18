@@ -55,6 +55,7 @@ use crate::{
         serde::Sequence,
         tombstone::{Tombstone, TombstoneLog},
     },
+    engine::{EntryAddressSnapshot, StorageEvent, StorageEventObserver, StorageRemovalReason},
     io::{
         PAGE,
         bytes::{IoSlice, IoSliceMut},
@@ -180,6 +181,7 @@ where
         tombstone_log: Option<TombstoneLog>,
         metrics: Arc<Metrics>,
         spawner: &Spawner,
+        observer: StorageEventObserver,
         #[cfg(any(test, feature = "test_utils"))] flush_switch: Switch,
     ) -> Result<()> {
         let id = self.id;
@@ -218,6 +220,7 @@ where
             compression,
             spawner: spawner.clone(),
             metrics: metrics.clone(),
+            observer,
             io_tasks: VecDeque::with_capacity(1),
             current_block_handle,
             max_entry_size,
@@ -318,6 +321,8 @@ where
     spawner: Spawner,
 
     metrics: Arc<Metrics>,
+
+    observer: StorageEventObserver,
 
     io_tasks: VecDeque<BoxFuture<'static, IoTaskCtx<K, V, P>>>,
 
@@ -496,6 +501,7 @@ where
                 let indexer = self.indexer.clone();
                 let block_manager = self.block_manager.clone();
                 let metrics = self.metrics.clone();
+                let observer = self.observer.clone();
 
                 async move {
                     // Wait for block is clean.
@@ -568,20 +574,43 @@ where
                         for index in indices {
                             let addr = HashedEntryAddress {
                                 hash: index.hash,
-                                address: EntryAddress {
+                                address: EntryAddress::new(
                                     block,
-                                    offset: blob_offset as u32 + index.offset,
-                                    len: index.len,
-                                    sequence: index.sequence,
-                                },
+                                    blob_offset as u32 + index.offset,
+                                    index.len,
+                                    index.sequence,
+                                ),
                             };
                             tracing::trace!(id, ?addr, "[flusher]: append address");
                             addrs.push(addr);
                         }
                     }
 
-                    let olds = indexer.insert_batch(addrs);
+                    let attempted = addrs;
+                    let olds = indexer.insert_batch(attempted.clone());
                     metrics.storage_block_engine_indexer_conflict.increase(olds.len() as _);
+                    for old in olds {
+                        let current = indexer.locate(old.hash);
+                        let rejected = attempted
+                            .iter()
+                            .any(|entry| entry.hash == old.hash && entry.address == old.address)
+                            && current.as_ref() != Some(&old.address);
+                        if !rejected && current.as_ref() != Some(&old.address) {
+                            observer.emit(StorageEvent::EntryRemoved {
+                                hash: old.hash,
+                                address: EntryAddressSnapshot::from(old.address),
+                                reason: StorageRemovalReason::Replaced,
+                            });
+                        }
+                    }
+                    for entry in attempted {
+                        if indexer.locate(entry.hash).as_ref() == Some(&entry.address) {
+                            observer.emit(StorageEvent::EntryCommitted {
+                                hash: entry.hash,
+                                address: EntryAddressSnapshot::from(entry.address),
+                            });
+                        }
+                    }
 
                     // Window expect window is full, make it evictable.
                     let id = block.id();

@@ -79,12 +79,12 @@ impl BlockScanner {
             .into_iter()
             .map(|index| EntryInfo {
                 hash: index.hash,
-                addr: EntryAddress {
-                    block: self.block.id(),
-                    offset: self.offset as u32 + index.offset,
-                    len: index.len,
-                    sequence: index.sequence,
-                },
+                addr: EntryAddress::new(
+                    self.block.id(),
+                    self.offset as u32 + index.offset,
+                    index.len,
+                    index.sequence,
+                ),
             })
             .inspect(|info| tracing::trace!(?info, "[scanner] extract entry info"))
             .collect_vec();
@@ -199,12 +199,12 @@ mod tests {
                 .iter()
                 .map(|index| EntryInfo {
                     hash: index.hash,
-                    addr: EntryAddress {
+                    addr: EntryAddress::new(
                         block,
-                        offset: part.blob_block_offset as u32 + index.offset,
-                        len: index.len,
-                        sequence: index.sequence,
-                    },
+                        part.blob_block_offset as u32 + index.offset,
+                        index.len,
+                        index.sequence,
+                    ),
                 })
                 .collect_vec()
         }
